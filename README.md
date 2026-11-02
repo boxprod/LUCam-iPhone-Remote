@@ -116,8 +116,12 @@ view and restores any camera that is in live mode.
     applying one can change more than exposure and colour.
   - **LUT**: display LUT on/off for each output that has one: **Screen** (the
     phone's display) and **HDMI**. It only affects monitoring.
-  - **Clean feed**: the picture without the app's overlays, for each output
-    that has the switch (on iPhones, only **HDMI**).
+  - **HDMI video › Clean feed**: the HDMI picture without the app's overlays.
+    Switching it on or off also sets the app's HDMI output to **Video feed**
+    (instead of Mirror display). The API has no setting for that, so the
+    controller applies a copy of the phone's current settings with that one
+    option changed, through a temporary preset it deletes straight after.
+    Not possible while recording.
 - **↻** reconnects a camera from scratch.
 - Cameras are listed by camera letter (A, B, C…), here and in Multiview. Cameras whose letter isn't known yet (connecting, offline) come last.
 - **⋯** menu: auto white balance, open/stop live view, reconnect, remove.

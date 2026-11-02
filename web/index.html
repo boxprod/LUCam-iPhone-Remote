@@ -657,8 +657,10 @@ const DISPLAY_LABELS = { Device: 'Screen', HDMI: 'HDMI' };
 const MONITOR_SWITCHES = [
 	{ param: 'displaylut', key: 'displayLuts', group: 'lutGroup', label: 'LUT',
 	  title: d => 'Display LUT on the ' + d + ' output (preview only, not recorded)' },
-	{ param: 'cleanfeed', key: 'cleanFeeds', group: 'cleanGroup', label: 'Clean feed',
-	  title: d => 'Clean feed on the ' + d + ' output: the picture without the app\'s overlays' },
+	{ param: 'cleanfeed', key: 'cleanFeeds', group: 'cleanGroup', label: 'HDMI video',
+	  name: d => d === 'HDMI' ? 'Clean feed' : d + ' clean feed',
+	  title: d => 'Clean feed on the ' + d + ' output: the picture without the app\'s overlays.'
+		+ (d === 'HDMI' ? '\nAlso sets the app\'s HDMI output to Video feed (not Mirror display).' : '') },
 ];
 function renderMonitorSwitches(r, cam) {
 	for (const m of MONITOR_SWITCHES) {
@@ -679,7 +681,7 @@ function renderMonitorSwitches(r, cam) {
 				group.append(sw);
 			}
 			sw.classList.toggle('on', !!values[name]);
-			sw.textContent = (DISPLAY_LABELS[name] || name) + (values[name] ? ' on' : ' off');
+			sw.textContent = (m.name ? m.name(name) : DISPLAY_LABELS[name] || name) + (values[name] ? ' on' : ' off');
 			sw.disabled = !cam.online;
 		}
 	}

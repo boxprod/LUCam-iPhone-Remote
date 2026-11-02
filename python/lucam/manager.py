@@ -805,6 +805,8 @@ class CameraWorker(threading.Thread):
 				raise ValueError('no {} switch for display {}'.format(feature, display))
 			c.set_monitor_switch(display, feature, enabled)
 			self._update(**{key: dict(self.state.get(key) or {}, **{display: enabled})})
+			if param == 'cleanfeed' and display == 'HDMI':
+				self._hdmi_video_feed()
 		elif param == 'focuslock':
 			lock = str(value).lower() in ('1', 'true', 'on', 'lock', 'locked')
 			if lock and self.state.get('autofocus') != 'Off':
@@ -954,6 +956,48 @@ class CameraWorker(threading.Thread):
 				self.state['name'] or self.state['address'], self.focus_hold * 100, focus * 100))
 		self._update(autofocus='Off')
 		return self.focus_hold
+
+	HDMI_VIDEO_FEED = 4   # appsettings.hdmiOut in presets: 0 = mirror display, 4 = video feed
+
+	def _hdmi_video_feed(self):
+		"""Set the app's HDMI output to "Video feed" (not "Mirror display"), so the
+		clean feed switch has an effect. The API has no setting for it, but presets
+		carry it: apply a copy of the current settings with hdmiOut changed."""
+		c = self.client
+		if self.state['recording']:
+			raise api.ApiError(0, 'clean feed set, but HDMI can only be switched to video feed when not recording')
+		tag = 'lucam-' + uuid.uuid4().hex[:6]
+		made = []
+		focus = self._try('focus', c.focus)
+		try:
+			c.save_preset(tag)
+			made.append(tag)
+			settings = json.loads(c.download_preset(tag)[0])
+			app = settings.get('appsettings') or {}
+			if app.get('hdmiOut') == self.HDMI_VIDEO_FEED:
+				return
+			app['hdmiOut'] = self.HDMI_VIDEO_FEED
+			# The saved focus can be wrong (0 when saved while the app's menu is
+			# open), and applying it with the app's focus lock on froze focus
+			# there: use the position the API reports.
+			sc = settings.get('secondaryControlsData')
+			if focus is not None and isinstance(sc, dict) and 'focusValue' in sc:
+				sc['focusValue'] = focus
+			copy = c.upload_preset(tag + '-hdmi.cset', json.dumps(settings).encode())
+			made.append(copy)
+			c.apply_preset(copy)
+			# The copy's focus can be off (e.g. saved while the app's menu was
+			# open): put focus back where it was.
+			if focus is not None and self._try('focus', c.focus) != focus:
+				c.set_focus(focus)
+		except ValueError as e:
+			raise api.ApiError(0, 'could not switch HDMI to video feed ({})'.format(e))
+		finally:
+			for name in made:
+				try:
+					c.delete_preset(name)
+				except api.ApiError:
+					pass
 
 	def _set_lens(self, value):
 		"""A lens id from the phone's list, or a focal length in mm: picks the
