@@ -100,9 +100,14 @@ view and restores any camera that is in live mode.
   - **Focus** slider, 0–100 % on the phone's own scale. Moving it turns
     continuous autofocus off; the phone does this itself.
   - **Autofocus** switch (continuous on/off) and **Focus once**.
-  - **Lock focus**: turns autofocus off and refuses every focus change for
-    that camera until unlocked. The app has no lock of its own, so the
-    controller holds it, saved in `cameras.json`.
+  - **Lock focus**: turns autofocus off, refuses every focus change from here,
+    and holds the focus position: if anything on the phone moves it (tap to
+    focus, an autofocus pass), the controller puts it back within half a
+    second. The app's own focus lock isn't in its API, so the controller
+    holds it, saved in `cameras.json`. A tap still makes the phone refocus for
+    about a second before it's put back: to stop that, also press the lock
+    under the focus slider in the app. The slider here keeps working while
+    the app's lock is on.
   - **Presets**: the camera's presets (active one marked), with **⬇ Download**
     (saves the `.cset` file), **Apply**, **Delete**, **Save current…** (saves
     the camera's current settings as a new preset) and **⬆ Upload…**

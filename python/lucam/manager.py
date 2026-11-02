@@ -144,19 +144,23 @@ def format_shutter(info):
 
 class CameraWorker(threading.Thread):
 	POLL_FAST = 0.5      # record state / timecode
+	POLL_FOCUS_LOCKED = 0.2   # while focus is locked: undo a tap to focus quickly
 	POLL_FULL = 3.0      # all settings
 	RETRY_OFFLINE = 2.0
 
 	def __init__(self, manager, cam_id, address, name='', active=True, live_mode=False, saved_format=None,
-				 focus_locked=False, wb_hold=None):
+				 focus_locked=False, wb_hold=None, focus_hold=None):
 		super().__init__(name='lucam-' + cam_id, daemon=True)
 		self.manager = manager
 		# Live mode: the camera temporarily records H.264 1080p so it can stream;
 		# `saved_format` is its real recording format, restored on exit and before REC.
 		self.live_mode = bool(live_mode and saved_format)
-		# Focus lock is ours (the app has no lock setting): AF off, and focus
-		# commands refused until unlocked. Saved in cameras.json.
+		# Focus lock is ours (the app's own lock isn't in the API): AF off, focus
+		# commands refused, and the position held: put back if the phone moves it
+		# (tap to focus, an AF pass). Saved in cameras.json.
 		self.focus_locked = bool(focus_locked)
+		self.focus_hold = focus_hold if self.focus_locked else None   # None: take the next reading
+		self._focus_restoring = False
 		# White balance lock is ours too: the API has no auto-WB switch, so the
 		# last WB/tint set from here is held and restored if the phone changes it.
 		# Auto WB or applying a preset releases it. Saved in cameras.json.
@@ -291,12 +295,12 @@ class CameraWorker(threading.Thread):
 				upd['timecode'] = tc
 			fo = self._try('focus', c.focus)
 			if fo is not None:
-				upd['focus'] = fo
+				upd['focus'] = self._hold_focus(fo)
 			self._update(**upd)
 			if now >= self._next_full:
 				self._poll_settings()
 				self._next_full = now + self.POLL_FULL
-			self._next_fast = now + self.POLL_FAST
+			self._next_fast = now + (self.POLL_FOCUS_LOCKED if self.focus_locked else self.POLL_FAST)
 		except api.ApiError as e:
 			if not self.resolved and self._try_other_addresses():
 				self._next_fast = self._next_full = 0
@@ -799,6 +803,7 @@ class CameraWorker(threading.Thread):
 			if lock and self.state.get('autofocus') != 'Off':
 				c.set_autofocus(False)   # hold focus where it is
 				self._update(autofocus='Off')
+			self.focus_hold = c.focus() if lock else None
 			self.focus_locked = lock
 			self._update(focusLocked=lock)
 			self.manager._save_later()
@@ -918,6 +923,31 @@ class CameraWorker(threading.Thread):
 			self._wb_restores = 0
 		upd['wbHold'] = dict(self.wb_hold)
 
+	def _hold_focus(self, focus):
+		"""While focus is locked, put it back if it moved; returns the focus to show."""
+		if not self.focus_locked:
+			return focus
+		if self.focus_hold is None:
+			self.focus_hold = focus
+			self.manager._save_later()
+			return focus
+		if abs(focus - self.focus_hold) < 1.5 / 255:   # the phone steps in 1/255 and may read back one off
+			self._focus_restoring = False
+			return focus
+		try:
+			self.client.set_focus(self.focus_hold)   # also ends continuous AF
+		except api.ApiError as e:
+			if e.status == 0:
+				raise
+			self._error('could not restore locked focus ({})'.format(e))
+			return focus
+		if not self._focus_restoring:   # one log line per disturbance, not per poll
+			self._focus_restoring = True
+			self.manager._log('{}: focus moved on the phone ({:.0f}% -> {:.0f}%), restored'.format(
+				self.state['name'] or self.state['address'], self.focus_hold * 100, focus * 100))
+		self._update(autofocus='Off')
+		return self.focus_hold
+
 	def _set_lens(self, value):
 		"""A lens id from the phone's list, or a focal length in mm: picks the
 		back lens with that focal length, else zooms (phones without /lens/cameras)."""
@@ -994,7 +1024,7 @@ class CameraManager:
 				self._spawn(cam.get('id') or uuid.uuid4().hex[:8], cam['address'],
 							cam.get('name', ''), cam.get('active', True),
 							cam.get('liveMode', False), cam.get('savedFormat'), cam.get('focusLocked', False),
-						cam.get('wbHold'))
+						cam.get('wbHold'), cam.get('focusHold'))
 			except (KeyError, ValueError) as e:
 				self._log('skipping saved camera: {}'.format(e))
 
@@ -1007,7 +1037,7 @@ class CameraManager:
 							 'address': w.state['address'] if w.resolved else w.typed_address,
 							 'name': w.state['name'], 'active': w.state['active'],
 							 **({'liveMode': True, 'savedFormat': w.saved_format} if w.live_mode else {}),
-							 **({'focusLocked': True} if w.focus_locked else {}),
+							 **({'focusLocked': True, 'focusHold': w.focus_hold} if w.focus_locked else {}),
 						 **({'wbHold': w.wb_hold} if w.wb_hold else {})}
 							for w in self.workers.values()],
 				'global': self.global_values,
@@ -1035,8 +1065,9 @@ class CameraManager:
 	# --- cameras ------------------------------------------------------------------
 
 	def _spawn(self, cam_id, address, name, active, live_mode=False, saved_format=None, focus_locked=False,
-			   wb_hold=None):
-		w = CameraWorker(self, cam_id, address, name, active, live_mode, saved_format, focus_locked, wb_hold)
+			   wb_hold=None, focus_hold=None):
+		w = CameraWorker(self, cam_id, address, name, active, live_mode, saved_format, focus_locked, wb_hold,
+						 focus_hold)
 		with self.lock:
 			self.workers[cam_id] = w
 		w.start()

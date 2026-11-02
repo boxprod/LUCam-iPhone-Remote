@@ -715,9 +715,12 @@ function renderExpand(r, cam) {
 	r.lock.classList.toggle('on', locked);
 	r.lock.textContent = locked ? '🔒 Focus locked' : '🔓 Lock focus';
 	r.lock.disabled = !usable;
-	r.lock.title = locked ? 'Unlock focus' : 'Turn autofocus off and block focus changes until unlocked';
+	r.lock.title = locked ? 'Unlock focus'
+		: 'Turn autofocus off, block focus changes from here and put focus back if the phone moves it.\n'
+		+ 'Taps on the phone screen still refocus for about a second: to stop that, also press the lock under the focus slider on the phone (the API can\'t switch it).';
 	r.focusNote.textContent = !cam.online ? 'offline' : !cam.focusControllable ? 'focus not controllable on this camera'
-		: locked ? 'held at ' + Math.round((cam.focus || 0) * 100) + '%' : afOn ? 'moving the slider turns autofocus off' : '';
+		: locked ? 'held at ' + Math.round((cam.focus || 0) * 100) + '% · to stop taps refocusing, also lock focus on the phone'
+		: afOn ? 'moving the slider turns autofocus off' : '';
 	r.chev.title = 'More controls (focus' + (locked ? ', locked' : afOn ? ', AF on' : '') + ', presets, LUT)';
 	renderLuts(r, cam);
 	for (const b of r.presetAll) b.disabled = !cam.online || (r.presetButtons.includes(b) && !r.presetCount);
