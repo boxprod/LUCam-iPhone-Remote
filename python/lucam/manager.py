@@ -484,6 +484,8 @@ class CameraWorker(threading.Thread):
 			fr = fmt.get('frameRate')
 			if self._device_format and fr != self._device_format.get('frameRate'):
 				self._caps_dirty = True  # shutter/ISO lists can depend on frame rate
+			if self._device_format and fmt.get('recordResolution') != self._device_format.get('recordResolution'):
+				self._caps_dirty = True  # turning the phone swaps its format list (vertical crops)
 			self._device_format = fmt
 			dr = self._try('colorspace', c.dynamic_range)
 			if dr is not None:
@@ -539,12 +541,13 @@ class CameraWorker(threading.Thread):
 		shown = self.saved_format if self.live_mode else self._device_format
 		if not shown:
 			return {}
-		entry = self._entry(res_key(shown.get('recordResolution')))
+		entry = self._entry_for(shown)
 		return {
 			'fps': shown.get('frameRate'),
 			'colorspace': shown.get('_dynamicRange') if self.live_mode else self._device_dr,
 			'codec': shown.get('codec'),
-			'resolution': res_key(shown.get('recordResolution')),
+			# a vertical crop shows as the format it's cut from (e.g. 1214x2160 -> 4K)
+			'resolution': res_key((entry or shown).get('recordResolution')),
 			'codecOptions': [{'value': c, 'label': codec_label(c)} for c in (entry or {}).get('codecs', [])],
 			'fpsOptions': (entry or {}).get('frameRates', []),
 			'liveMode': self.live_mode,
@@ -557,10 +560,23 @@ class CameraWorker(threading.Thread):
 				return f
 		return None
 
+	def _entry_for(self, fmt):
+		"""Supported-format entry for a format. In vertical mode the phone records
+		a crop (e.g. 1214x2160) that isn't listed: match it to its 16:9 source by
+		descriptor ('4K', 'HD'...) and height."""
+		res = fmt.get('recordResolution') or {}
+		entry = self._entry(res_key(res))
+		if entry is None:
+			desc = (fmt.get('resolutionDescriptor') or {}).get('description')
+			entry = next((f for f in self._supported
+						  if desc and (f.get('resolutionDescriptor') or {}).get('description') == desc), None) or \
+				next((f for f in self._supported if (f.get('recordResolution') or {}).get('height') == res.get('height')), None)
+		return entry
+
 	def _build_format(self, base, codec=None, resolution=None, fps=None):
 		"""Full /system/format object (the phone rejects partial ones)."""
 		fmt = dict(base)
-		entry = self._entry(resolution or res_key(base.get('recordResolution')))
+		entry = self._entry(resolution) if resolution else self._entry_for(base)
 		if entry is None:
 			raise ValueError('unsupported resolution {}'.format(resolution))
 		if resolution:
