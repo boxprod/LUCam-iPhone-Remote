@@ -17,7 +17,7 @@ import uuid
 from . import api, discovery, livestream
 
 PARAMS = ('lens', 'iso', 'fps', 'shutter', 'wb', 'tint', 'letter', 'reel', 'codec', 'resolution', 'colorspace',
-		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut', 'iris')
+		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut', 'cleanfeed', 'iris')
 
 # Third-stop f-numbers offered for the iris, filtered to each camera's range.
 F_STOPS = (1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6,
@@ -57,6 +57,8 @@ def parse_f_stop(value):
 			s = s[len(prefix):]
 			break
 	return float(s)
+# Per-display on/off switches: param -> (API feature, state key)
+MONITOR_SWITCHES = {'displaylut': ('displayLUT', 'displayLuts'), 'cleanfeed': ('cleanFeed', 'cleanFeeds')}
 FOCUS_PARAMS = ('focus', 'autofocus', 'focusonce')   # refused while a camera's focus is locked
 
 # Recording format used while a camera is in live view: the app only streams
@@ -171,7 +173,7 @@ class CameraWorker(threading.Thread):
 		self._format_lock = threading.Lock()
 		self._supported = []
 		self._lenses = []
-		self._lut_displays = []
+		self._monitor_displays = {p: [] for p in MONITOR_SWITCHES}   # displays that have each switch
 		self._iris_controllable = False
 		self._device_format = None
 		self._device_dr = None
@@ -212,6 +214,7 @@ class CameraWorker(threading.Thread):
 			'focus': None, 'focusControllable': False, 'autofocus': None, 'autofocusSupported': False,
 			'focusLocked': bool(focus_locked),
 			'displayLuts': {},   # {'Device': False, 'HDMI': True}: display LUT on/off per display
+			'cleanFeeds': {},    # {'HDMI': False}: clean feed (no overlays) per display
 			'iso': None, 'isoOptions': [],
 			'fps': None, 'fpsOptions': [],
 			'codec': None, 'codecOptions': [], 'resolution': None, 'resolutionOptions': [],
@@ -405,16 +408,18 @@ class CameraWorker(threading.Thread):
 										 f['recordResolution']['width'], f['recordResolution']['height']).strip(' ·'),
 		} for f in self._supported if f.get('recordResolution')]
 		upd['colorspaceOptions'] = self._try('colorspace', c.supported_dynamic_ranges) or []
-		# Displays with a LUT switch: the listed ones plus HDMI (not listed).
+		# Displays with each switch: the listed ones plus HDMI (not listed). The
+		# phone screen has a LUT switch but no clean feed; HDMI has both.
 		names = list(dict.fromkeys((self._try('displaylut', c.displays) or []) + ['HDMI']))
-		self._lut_displays = []
-		for name in names:
-			try:
-				c.display_lut(name)
-				self._lut_displays.append(name)
-			except api.ApiError as e:
-				if e.status == 0:
-					raise
+		for param, (feature, _) in MONITOR_SWITCHES.items():
+			self._monitor_displays[param] = []
+			for name in names:
+				try:
+					c.monitor_switch(name, feature)
+					self._monitor_displays[param].append(name)
+				except api.ApiError as e:
+					if e.status == 0:
+						raise
 		idesc = self._try('iris', c.iris_description) or {}
 		self._iris_controllable = bool(idesc.get('controllable'))
 		rng = idesc.get('apertureStop') or {}
@@ -495,14 +500,15 @@ class CameraWorker(threading.Thread):
 			if dr is not None:
 				self._device_dr = dr
 			upd.update(self._format_state())
-		luts = {}
-		for name in self._lut_displays:
-			try:
-				luts[name] = c.display_lut(name)
-			except api.ApiError as e:
-				if e.status == 0:
-					raise
-		upd['displayLuts'] = luts
+		for param, (feature, key) in MONITOR_SWITCHES.items():
+			values = {}
+			for name in self._monitor_displays[param]:
+				try:
+					values[name] = c.monitor_switch(name, feature)
+				except api.ApiError as e:
+					if e.status == 0:
+						raise
+			upd[key] = values
 		af = self._try('autofocus', c.autofocus)
 		if af:
 			upd['autofocusSupported'] = bool(af.get('supported', True))
@@ -789,15 +795,16 @@ class CameraWorker(threading.Thread):
 			self._update(autofocus='Continuous' if on else 'Off')
 		elif param == 'focusonce':
 			c.focus_once()
-		elif param == 'displaylut':
+		elif param in MONITOR_SWITCHES:
 			# value: {'display': 'HDMI', 'enabled': True}
 			if not isinstance(value, dict) or 'display' not in value or 'enabled' not in value:
 				raise ValueError('expected {"display": ..., "enabled": ...}')
 			display, enabled = str(value['display']), bool(value['enabled'])
-			if display not in self._lut_displays:
-				raise ValueError('no LUT switch for display ' + display)
-			c.set_display_lut(display, enabled)
-			self._update(displayLuts=dict(self.state.get('displayLuts') or {}, **{display: enabled}))
+			feature, key = MONITOR_SWITCHES[param]
+			if display not in self._monitor_displays[param]:
+				raise ValueError('no {} switch for display {}'.format(feature, display))
+			c.set_monitor_switch(display, feature, enabled)
+			self._update(**{key: dict(self.state.get(key) or {}, **{display: enabled})})
 		elif param == 'focuslock':
 			lock = str(value).lower() in ('1', 'true', 'on', 'lock', 'locked')
 			if lock and self.state.get('autofocus') != 'Off':

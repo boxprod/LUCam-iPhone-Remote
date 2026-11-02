@@ -49,6 +49,8 @@ def make_state(name, iris_controllable=True):
 		'slate': {'clip': {'clipName': 'A001_C001', 'reel': 1, 'scene': '1', 'take': 1},
 				  'project': {'projectName': 'Mock', 'camera': 'A'}},
 		'stream': 'Idle',
+		# like the iPhone app: the screen has a LUT switch, HDMI has LUT and clean feed
+		'monitor': {('Device', 'displayLUT'): False, ('HDMI', 'displayLUT'): False, ('HDMI', 'cleanFeed'): False},
 	}
 
 
@@ -115,6 +117,10 @@ def make_handler(state, lock, verbose):
 											   'apertureStop': {'min': 1.6, 'max': 8.0} if s['irisControllable'] else {'min': 1.78, 'max': 1.78}},
 					'/lens/zoom/description': {'controllable': True, 'focalLength': {'adjustable': True, 'min': 13, 'max': 120}},
 					'/slates/nextClip': s['slate'],
+					'/monitoring/display': {'displays': ['Device']},
+					'/monitoring/Device/displayLUT': {'enabled': s['monitor'][('Device', 'displayLUT')]},
+					'/monitoring/HDMI/displayLUT': {'enabled': s['monitor'][('HDMI', 'displayLUT')]},
+					'/monitoring/HDMI/cleanFeed': {'enabled': s['monitor'][('HDMI', 'cleanFeed')]},
 					'/livestreams/0': {'status': s['stream'], 'bitrate': 0, 'effectiveVideoFormat': '1080p25'},
 				}
 			if p in routes:
@@ -192,6 +198,8 @@ def make_handler(state, lock, verbose):
 					for k, v in body.items():
 						s['slate'].setdefault(k, {}).update(v)
 					return self._send(200, s['slate'])
+				elif p.startswith('/monitoring/') and tuple(p.split('/')[2:]) in s['monitor']:
+					s['monitor'][tuple(p.split('/')[2:])] = bool(body.get('enabled'))
 				elif p == '/livestreams/0/start':
 					s['stream'] = 'Streaming'
 				elif p == '/livestreams/0/stop':

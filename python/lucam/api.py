@@ -276,11 +276,12 @@ class CameraClient:
 		but has its own settings, so callers should also try 'HDMI'."""
 		return (self.get('/monitoring/display') or {}).get('displays', [])
 
-	def display_lut(self, display):
-		return bool((self.get('/monitoring/{}/displayLUT'.format(urllib.parse.quote(display))) or {}).get('enabled'))
+	def monitor_switch(self, display, feature):
+		"""On/off monitoring feature of one display: 'displayLUT', 'cleanFeed'..."""
+		return bool((self.get('/monitoring/{}/{}'.format(urllib.parse.quote(display), feature)) or {}).get('enabled'))
 
-	def set_display_lut(self, display, enabled):
-		self.put('/monitoring/{}/displayLUT'.format(urllib.parse.quote(display)), {'enabled': bool(enabled)})
+	def set_monitor_switch(self, display, feature, enabled):
+		self.put('/monitoring/{}/{}'.format(urllib.parse.quote(display), feature), {'enabled': bool(enabled)})
 
 	# --- presets (iPhone app: .cset / .bmcpreset JSON files) ------------------
 	# The list gives names without extension; downloads, apply and delete use

@@ -592,11 +592,12 @@ function buildExpand(r, cam) {
 	r.focusNote = el('span', 'note');
 	lg.append(r.lock, r.focusNote);
 
-	// Display LUT on/off, one switch per display that has one (screen, HDMI).
+	// Monitoring on/off switches, one per display that has them (screen, HDMI).
 	r.lutGroup = el('div', 'grp');
-	r.lutSwitches = {};
+	r.cleanGroup = el('div', 'grp');
+	r.monitorSwitches = {};
 	x.append(fg, el('span', 'sep'), ag, el('span', 'sep'), lg, el('span', 'row-break'), buildPresets(r, cam),
-		el('span', 'sep'), r.lutGroup);
+		el('span', 'sep'), r.lutGroup, el('span', 'sep'), r.cleanGroup);
 	r.expand = x;
 	r.el.append(x);
 	if (!x.hidden) loadPresets(r);
@@ -652,25 +653,35 @@ function buildPresets(r, cam) {
 	return g;
 }
 
-const LUT_LABELS = { Device: 'Screen', HDMI: 'HDMI' };
-function renderLuts(r, cam) {
-	const luts = cam.displayLuts || {};
-	const names = Object.keys(luts);
-	r.lutGroup.hidden = !names.length;
-	if (!r.lutGroup.firstChild && names.length) r.lutGroup.append(el('span', 'lbl', 'LUT'));
-	for (const name of names) {
-		let sw = r.lutSwitches[name];
-		if (!sw) {
-			sw = el('button', 'switch');
-			sw.title = 'Display LUT on the ' + (LUT_LABELS[name] || name) + ' output (preview only, not recorded)';
-			sw.addEventListener('click', () => act('/cameras/' + cam.id + '/set',
-				{ param: 'displaylut', value: { display: name, enabled: !r.cam.displayLuts[name] } }));
-			r.lutSwitches[name] = sw;
-			r.lutGroup.append(sw);
+const DISPLAY_LABELS = { Device: 'Screen', HDMI: 'HDMI' };
+const MONITOR_SWITCHES = [
+	{ param: 'displaylut', key: 'displayLuts', group: 'lutGroup', label: 'LUT',
+	  title: d => 'Display LUT on the ' + d + ' output (preview only, not recorded)' },
+	{ param: 'cleanfeed', key: 'cleanFeeds', group: 'cleanGroup', label: 'Clean feed',
+	  title: d => 'Clean feed on the ' + d + ' output: the picture without the app\'s overlays' },
+];
+function renderMonitorSwitches(r, cam) {
+	for (const m of MONITOR_SWITCHES) {
+		const values = cam[m.key] || {};
+		const names = Object.keys(values);
+		const group = r[m.group];
+		group.hidden = !names.length;
+		if (!group.firstChild && names.length) group.append(el('span', 'lbl', m.label));
+		for (const name of names) {
+			const id = m.param + ':' + name;
+			let sw = r.monitorSwitches[id];
+			if (!sw) {
+				sw = el('button', 'switch');
+				sw.title = m.title(DISPLAY_LABELS[name] || name);
+				sw.addEventListener('click', () => act('/cameras/' + cam.id + '/set',
+					{ param: m.param, value: { display: name, enabled: !(r.cam[m.key] || {})[name] } }));
+				r.monitorSwitches[id] = sw;
+				group.append(sw);
+			}
+			sw.classList.toggle('on', !!values[name]);
+			sw.textContent = (DISPLAY_LABELS[name] || name) + (values[name] ? ' on' : ' off');
+			sw.disabled = !cam.online;
 		}
-		sw.classList.toggle('on', !!luts[name]);
-		sw.textContent = (LUT_LABELS[name] || name) + (luts[name] ? ' on' : ' off');
-		sw.disabled = !cam.online;
 	}
 }
 
@@ -721,8 +732,8 @@ function renderExpand(r, cam) {
 	r.focusNote.textContent = !cam.online ? 'offline' : !cam.focusControllable ? 'focus not controllable on this camera'
 		: locked ? 'held at ' + Math.round((cam.focus || 0) * 100) + '% · to stop taps refocusing, also lock focus on the phone'
 		: afOn ? 'moving the slider turns autofocus off' : '';
-	r.chev.title = 'More controls (focus' + (locked ? ', locked' : afOn ? ', AF on' : '') + ', presets, LUT)';
-	renderLuts(r, cam);
+	r.chev.title = 'More controls (focus' + (locked ? ', locked' : afOn ? ', AF on' : '') + ', presets, LUT, clean feed)';
+	renderMonitorSwitches(r, cam);
 	for (const b of r.presetAll) b.disabled = !cam.online || (r.presetButtons.includes(b) && !r.presetCount);
 	if (cam.online && r.presetCount === undefined && !r.expand.hidden && !r.presetLoading) {
 		r.presetLoading = true;
