@@ -800,15 +800,6 @@ class CameraManager:
 				w.state['active'] = bool(active)
 		self._save_later()
 
-	def move_camera(self, cam_id, delta):
-		with self.lock:
-			ids = list(self.workers)
-			i = ids.index(cam_id)
-			j = max(0, min(len(ids) - 1, i + int(delta)))
-			ids.insert(j, ids.pop(i))
-			self.workers = {k: self.workers[k] for k in ids}
-		self._save_later()
-
 	def _worker(self, cam_id):
 		with self.lock:
 			w = self.workers.get(cam_id)
@@ -923,7 +914,10 @@ class CameraManager:
 			disc['results'] = [dict(r, added=r['address'] in addresses) for r in disc['results']]
 			glob = dict(self.global_values)
 			log = list(self.log[-10:])
-		cams = [w.snapshot() for w in workers]
+		# Sorted by camera letter (A, B, C...), then name; cameras without a
+		# letter yet (offline, connecting) go last.
+		cams = sorted((w.snapshot() for w in workers), key=lambda c: (
+			not (c['letter'] or '').strip(), (c['letter'] or '').strip().upper(), (c['name'] or c['address']).lower()))
 		paths = self.live.paths() if any(c['liveOurs'] for c in cams) else {}
 		for c in cams:
 			p = paths.get('live/' + c['id'])
@@ -1025,8 +1019,6 @@ class CameraManager:
 				self.stream([cam_id], p['enabled'])
 			elif action == 'refresh':
 				self.refresh(cam_id)
-			elif action == 'move':
-				self.move_camera(cam_id, p.get('delta', 0))
 			else:
 				raise KeyError('no route')
 			return None

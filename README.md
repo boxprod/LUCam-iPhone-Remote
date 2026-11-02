@@ -88,7 +88,8 @@ view and restores any camera that is in live mode.
 - Each value field takes typing + Enter, ↑/↓ to step (Shift ×10), or the ▾ list of values the camera reports as supported.
 - An amber value is still being sent. If the camera rejects it, the field reverts and the error shows under the camera name.
 - **↻** reconnects a camera from scratch.
-- **⋯** menu: auto white balance, open/stop live view, reconnect, reorder, remove.
+- Cameras are listed by camera letter (A, B, C…), here and in Multiview. Cameras whose letter isn't known yet (connecting, offline) come last.
+- **⋯** menu: auto white balance, open/stop live view, reconnect, remove.
 
 ## Live view (video feed)
 

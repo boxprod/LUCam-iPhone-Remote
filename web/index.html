@@ -461,8 +461,6 @@ function buildRow(cam) {
 			{ label: 'Open live view', value: 'live', text: true },
 			...(r.cam.liveOurs || r.cam.liveMode ? [{ label: 'Stop live view (restore format)', value: 'stoplive', text: true }] : []),
 			{ label: 'Reconnect', value: 'refresh', text: true },
-			{ label: 'Move up', value: 'up', text: true },
-			{ label: 'Move down', value: 'down', text: true },
 			{ label: 'Remove camera', value: 'remove', text: true },
 		];
 		showMenu(more, items, null, v => {
@@ -475,8 +473,6 @@ function buildRow(cam) {
 			}
 			if (v === 'stoplive') act(base + '/stream', { enabled: false });
 			if (v === 'refresh') act(base + '/refresh');
-			if (v === 'up') act(base + '/move', { delta: -1 });
-			if (v === 'down') act(base + '/move', { delta: 1 });
 			if (v === 'remove' && confirm('Remove ' + (r.cam.name || r.cam.address) + '?')) act(base + '/remove');
 		});
 	});
