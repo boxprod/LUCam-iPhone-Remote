@@ -13,6 +13,7 @@
 	--muted: #8b929c;
 	--accent: #f0a429;
 	--ok: #3fcf73;
+	--warn: #f0a429;
 	--rec: #e8322b;
 	--radius: 6px;
 }
@@ -21,16 +22,25 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 body { font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
 button { font: inherit; color: inherit; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-header { display: flex; align-items: center; gap: 14px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex: none; }
-header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex: none; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .02em; }
+header .page { color: var(--accent); font-weight: 650; }
 header .sub { color: var(--muted); }
 header .spacer { flex: 1; }
-header a { color: var(--muted); text-decoration: none; }
-header a:hover { color: var(--text); }
+a.btn { text-decoration: none; color: var(--text); }
+.conn { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.ok { background: var(--ok); }
+.dot.bad { background: var(--rec); }
 .btn { border: 1px solid var(--line); background: #1d2024; border-radius: var(--radius); padding: 5px 11px; cursor: pointer; white-space: nowrap; }
 .btn:hover { background: #23272c; border-color: #3c424a; }
 .btn:disabled { opacity: .4; cursor: default; }
 .btn.rec.on { background: var(--rec); border-color: var(--rec); color: #fff; }
+.btn.rec .led { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--rec); margin-right: 7px; vertical-align: -1px; }
+.btn.rec.on .led { background: #fff; }
+.btn.big { padding: 9px 18px; font-size: 14px; min-width: 84px; font-weight: 700; letter-spacing: .06em; }
+.toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 6px; z-index: 60; max-width: 420px; }
+.toast { background: #2a1513; border: 1px solid #6b2420; color: #ffd0cc; padding: 8px 12px; border-radius: var(--radius); font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #111; font-weight: 600; }
 
 main { flex: 1; min-height: 0; padding: 12px; display: grid; gap: 12px; grid-template-columns: repeat(var(--n, 1), minmax(0, 1fr)); align-content: center; }
@@ -54,14 +64,19 @@ main.single .tile { height: 100%; }
 </head>
 <body>
 <header>
-	<h1 id="title">Live view</h1>
-	<span class="sub" id="sub"></span>
+	<h1>LUCam iPhone Remote</h1>
+	<span class="page" id="title">Multiview</span>
+	<span class="sub" id="summary">–</span>
+	<span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
 	<span class="spacer"></span>
 	<button class="btn" id="startAll" hidden>Start all armed</button>
-	<a href="/live" id="multiLink">Multiview</a>
-	<a href="/">Control panel</a>
+	<a class="btn" href="/live" id="multiLink">Multiview</a>
+	<a class="btn" href="/">Control panel</a>
+	<button class="btn rec big" id="recAll" title="Start recording on all armed cameras. Live views stop first: each camera goes back to its real recording format."><span class="led"></span>REC ALL</button>
+	<button class="btn big" id="stopAll" title="Stop recording on all armed cameras">■ STOP ALL</button>
 </header>
 <main id="grid"></main>
+<div class="toasts" id="toasts"></div>
 
 <script>
 'use strict';
@@ -73,8 +88,16 @@ let state = { cameras: [] };
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
 async function api(path, body) {
 	const res = await fetch('/api' + path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-	return res.json();
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) throw new Error(data.error || res.statusText);
+	return data;
 }
+function toast(msg) {
+	const t = el('div', 'toast', msg);
+	document.getElementById('toasts').appendChild(t);
+	setTimeout(() => t.remove(), 5000);
+}
+const act = (path, body) => api(path, body || {}).catch(e => toast(e.message));
 const playerUrl = cam => location.protocol + '//' + location.hostname + ':8889/' + cam.livePath + '/?controls=false&muted=true&autoplay=true&playsinline=true';
 const mbps = b => b ? (b / 1e6).toFixed(1) + ' Mbit/s' : '';
 
@@ -86,9 +109,9 @@ function buildTile(cam) {
 	t.meta = el('span', 'meta mono');
 	t.rate = el('span', 'meta mono');
 	t.rec = el('button', 'btn rec');
-	t.rec.addEventListener('click', () => api('/cameras/' + cam.id + '/record', { recording: !t.cam.recording }));
+	t.rec.addEventListener('click', () => act('/cameras/' + cam.id + '/record', { recording: !t.cam.recording }));
 	t.toggle = el('button', 'btn');
-	t.toggle.addEventListener('click', () => api('/cameras/' + cam.id + '/stream', { enabled: !t.cam.liveOurs }));
+	t.toggle.addEventListener('click', () => act('/cameras/' + cam.id + '/stream', { enabled: !t.cam.liveOurs }));
 	bar.append(t.tally, t.name, t.meta, el('span', 'spacer'), t.rate, t.rec, t.toggle);
 	if (!singleId) {
 		const open = el('button', 'btn', '⤢');
@@ -139,7 +162,7 @@ function renderTile(t, cam) {
 		if (!cam.liveOurs && cam.online) {
 			const actions = el('div', 'actions');
 			const b = el('button', 'btn primary', 'Start live view');
-			b.addEventListener('click', () => api('/cameras/' + cam.id + '/stream', { enabled: true }));
+			b.addEventListener('click', () => act('/cameras/' + cam.id + '/stream', { enabled: true }));
 			actions.append(b);
 			box.append(actions);
 		}
@@ -168,19 +191,43 @@ function render() {
 	if (!cams.length && !empty) grid.append(el('div', 'empty', singleId ? 'Unknown camera.' : 'No armed cameras. Arm cameras in the control panel, then start their live view.'));
 	if (cams.length && empty) empty.remove();
 
-	const live = state.cameras.filter(c => c.liveOurs).length;
 	document.getElementById('title').textContent = singleId ? (cams[0] ? (cams[0].name || cams[0].address) + ' — live' : 'Live view') : 'Multiview';
 	document.title = document.getElementById('title').textContent;
-	document.getElementById('sub').textContent = live + ' live';
 	document.getElementById('multiLink').hidden = !singleId;
 	const startAll = document.getElementById('startAll');
 	startAll.hidden = !!singleId || !state.cameras.some(c => c.active && c.online && !c.liveOurs);
 }
 
-document.getElementById('startAll').addEventListener('click', () => api('/global/stream', { enabled: true }));
+// Same as the control panel's top bar.
+function renderHeader(ok) {
+	const cams = state.cameras;
+	const online = cams.filter(c => c.online).length;
+	const recording = cams.filter(c => c.recording).length;
+	const live = cams.filter(c => c.liveOurs).length;
+	document.getElementById('summary').textContent =
+		cams.length + ' camera' + (cams.length === 1 ? '' : 's') + ' · ' + online + ' online' +
+		(recording ? ' · ' + recording + ' recording' : '') + ' · ' + live + ' live';
+	document.getElementById('connDot').className = 'dot ' + (ok ? 'ok' : 'bad');
+	document.getElementById('connText').textContent = ok ? 'controller connected' : 'controller unreachable';
+	const recAll = document.getElementById('recAll');
+	recAll.classList.toggle('on', !!state.anyRecording);
+	recAll.disabled = !cams.some(c => c.active && c.online);
+}
 
+document.getElementById('startAll').addEventListener('click', () => act('/global/stream', { enabled: true }));
+document.getElementById('recAll').addEventListener('click', () => act('/global/record', { recording: true }));
+document.getElementById('stopAll').addEventListener('click', () => act('/global/record', { recording: false }));
+
+let failures = 0;
 async function poll() {
-	try { state = await api('/state'); render(); } catch (e) { /* controller restarting */ }
+	try {
+		state = await api('/state');
+		failures = 0;
+		renderHeader(true);
+		render();
+	} catch (e) {
+		if (++failures > 2) renderHeader(false);   // controller restarting or unreachable
+	}
 	setTimeout(poll, 700);
 }
 poll();

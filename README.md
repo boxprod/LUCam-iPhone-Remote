@@ -96,7 +96,8 @@ view and restores any camera that is in live mode.
 ⋯ → **Open live view** on a camera opens a page
 with that camera's live picture. **Multiview** in the header shows every armed
 camera in a grid, with tally, slate and timecode, plus REC and live start/stop
-per tile. These pages also work from an iPad on the same network.
+per tile. Its top bar matches the control panel's, with **REC ALL** and
+**STOP ALL**. These pages also work from an iPad on the same network.
 
 How it works: the controller uploads a custom streaming platform called
 "LUCam iPhone Remote RTMP" to the phone, pointing at this Mac. It then starts the
