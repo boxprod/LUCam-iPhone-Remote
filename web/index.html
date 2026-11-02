@@ -139,6 +139,14 @@ main { padding: 12px 16px 40px; }
 .switch::before { content: ""; width: 28px; height: 16px; border-radius: 999px; background: #3a3f46 radial-gradient(circle at 8px 50%, #c9ced6 5px, transparent 5.5px); }
 .switch.on::before { background: var(--ok) radial-gradient(circle at 20px 50%, #fff 5px, transparent 5.5px); }
 .switch:disabled { opacity: .35; cursor: default; }
+/* on/off switches flip on click, pulse until the camera confirms, then flash
+   green; if the command didn't pass they shake and go back */
+.switch.sending, .btn.lock.sending { animation: sending 0.9s ease-in-out infinite; }
+.switch.confirmed, .btn.lock.confirmed { animation: confirmed 0.7s ease-out; }
+.switch.failed, .btn.lock.failed { animation: failed 0.5s ease-in-out; border-color: var(--rec); }
+@keyframes sending { 50% { opacity: .55; } }
+@keyframes confirmed { from { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 60%, transparent); } to { box-shadow: 0 0 0 0 transparent; } }
+@keyframes failed { 20%, 60% { transform: translateX(-3px); } 40%, 80% { transform: translateX(3px); } }
 .btn.lock.on { background: var(--accent); border-color: var(--accent); color: #111; font-weight: 600; }
 .expand select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 5px 6px; max-width: 220px; }
 .expand .row-break { flex-basis: 100%; height: 0; }
@@ -234,6 +242,7 @@ const UNSUPPORTED_KEY = { letter: 'slate', reel: 'slate' };
 
 let state = { cameras: [], global: {}, discovery: { results: [] } };
 const pending = {};   // "camId:param" -> {value, until}
+const toggles = {};   // "camId:key" -> {value, since, until, failed}: switches sent, not confirmed yet
 const rows = new Map();
 let openMenu = null;
 
@@ -454,6 +463,37 @@ function pendingFor(cam, param) {
 	return p;
 }
 
+// On/off switches show the new state as soon as they're clicked, until the
+// camera reports it (confirmed) or the command fails / times out (reverted).
+const TOGGLE_TIMEOUT = 6000;
+function sendToggle(cam, key, value, path, body) {
+	const k = cam.id + ':' + key;
+	toggles[k] = { value, since: Date.now(), until: Date.now() + TOGGLE_TIMEOUT };
+	api(path, body).catch(e => { if (toggles[k]) toggles[k].failed = true; toast(e.message); });
+	renderCams();
+}
+function toggleState(cam, key, actual) {
+	const k = cam.id + ':' + key, t = toggles[k];
+	if (!t) return { value: actual };
+	if (actual === t.value) { delete toggles[k]; return { value: actual, result: 'confirmed' }; }
+	const errored = cam.errorTime * 1000 >= t.since - 250;
+	if (t.failed || errored || Date.now() > t.until) {
+		delete toggles[k];
+		if (!t.failed && !errored) toast((cam.name || cam.address) + ': no confirmation from the camera, switch reverted');
+		return { value: actual, result: 'failed' };
+	}
+	return { value: t.value, sending: true };
+}
+function paintToggle(btn, st) {
+	btn.classList.toggle('sending', !!st.sending);
+	if (st.result) {
+		btn.classList.remove('confirmed', 'failed');
+		void btn.offsetWidth;   // restart the animation
+		btn.classList.add(st.result);
+		setTimeout(() => btn.classList.remove(st.result), 800);
+	}
+}
+
 function buildRow(cam) {
 	const r = { el: el('div', 'row cam'), ctl: {} };
 	r.arm = el('button', 'arm');
@@ -579,7 +619,8 @@ function buildExpand(r, cam) {
 	const ag = el('div', 'grp');
 	r.af = el('button', 'switch', 'Autofocus');
 	r.af.title = 'Continuous autofocus on/off';
-	r.af.addEventListener('click', () => send('autofocus', r.cam.autofocus !== 'Continuous'));
+	const sendSwitch = (key, param, value) => sendToggle(r.cam, key, value, '/cameras/' + cam.id + '/set', { param, value });
+	r.af.addEventListener('click', () => sendSwitch('autofocus', 'autofocus', !r.afShown));
 	r.once = el('button', 'btn', 'Focus once');
 	r.once.title = 'Autofocus once, then hold';
 	r.once.addEventListener('click', () => send('focusonce', true));
@@ -588,7 +629,7 @@ function buildExpand(r, cam) {
 	// Lock: held by the controller (the app has no lock): AF off, focus changes refused.
 	const lg = el('div', 'grp');
 	r.lock = el('button', 'btn lock');
-	r.lock.addEventListener('click', () => send('focuslock', !r.cam.focusLocked));
+	r.lock.addEventListener('click', () => sendSwitch('focuslock', 'focuslock', !r.lockShown));
 	r.focusNote = el('span', 'note');
 	lg.append(r.lock, r.focusNote);
 
@@ -675,13 +716,17 @@ function renderMonitorSwitches(r, cam) {
 			if (!sw) {
 				sw = el('button', 'switch');
 				sw.title = m.title(DISPLAY_LABELS[name] || name);
-				sw.addEventListener('click', () => act('/cameras/' + cam.id + '/set',
-					{ param: m.param, value: { display: name, enabled: !(r.cam[m.key] || {})[name] } }));
+				sw.addEventListener('click', () => {
+					const on = !sw.classList.contains('on');
+					sendToggle(r.cam, id, on, '/cameras/' + cam.id + '/set', { param: m.param, value: { display: name, enabled: on } });
+				});
 				r.monitorSwitches[id] = sw;
 				group.append(sw);
 			}
-			sw.classList.toggle('on', !!values[name]);
-			sw.textContent = (m.name ? m.name(name) : DISPLAY_LABELS[name] || name) + (values[name] ? ' on' : ' off');
+			const st = toggleState(cam, id, !!values[name]);
+			paintToggle(sw, st);
+			sw.classList.toggle('on', st.value);
+			sw.textContent = (m.name ? m.name(name) : DISPLAY_LABELS[name] || name) + (st.value ? ' on' : ' off');
 			sw.disabled = !cam.online;
 		}
 	}
@@ -711,7 +756,8 @@ async function loadPresets(r) {
 
 function renderExpand(r, cam) {
 	const usable = cam.online && cam.focusControllable;
-	const locked = !!cam.focusLocked;
+	const lockSt = toggleState(cam, 'focuslock', !!cam.focusLocked);
+	const locked = r.lockShown = lockSt.value;
 	r.focus.disabled = !usable || locked;
 	// don't fight the slider while it's being dragged (or just after)
 	if (cam.focus != null && !(r.focusTouched && Date.now() - r.focusTouched < 1500)) {
@@ -720,7 +766,10 @@ function renderExpand(r, cam) {
 	} else if (cam.focus == null && !r.focusTouched) {
 		r.focusVal.textContent = '–';
 	}
-	const afOn = cam.autofocus === 'Continuous';
+	const afSt = toggleState(cam, 'autofocus', cam.autofocus === 'Continuous');
+	const afOn = r.afShown = afSt.value;
+	paintToggle(r.af, afSt);
+	paintToggle(r.lock, lockSt);
 	r.af.classList.toggle('on', afOn);
 	r.af.textContent = afOn ? 'Autofocus on' : 'Autofocus off';
 	r.af.disabled = !cam.online || !cam.autofocusSupported || locked;

@@ -87,6 +87,7 @@ view and restores any camera that is in live mode.
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.
 - Each value field takes typing + Enter, ↑/↓ to step (Shift ×10), or the ▾ list of values the camera reports as supported.
 - An amber value is still being sent. If the camera rejects it, the field reverts and the error shows under the camera name.
+- On/off switches (autofocus, focus lock, LUT, clean feed) flip as soon as you click and pulse until the camera confirms, then flash green. If the command fails or isn't confirmed within 6 seconds, the switch shakes and goes back.
 - Values set from here stay locked, so the phone's automatic modes can't change them (focus has its own lock, below):
   - **ISO, Shutter, Iris** turn the app's auto exposure off.
   - **Lens** turns automatic lens switching off, on phones that have it.
