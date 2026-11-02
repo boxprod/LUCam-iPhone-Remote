@@ -314,11 +314,12 @@ function combo(param, onCommit) {
 	drop.addEventListener('mousedown', e => {
 		e.preventDefault();
 		if (openMenu) { closeMenu(); return; }
-		showMenu(wrap, wrap.options, wrap.current, v => commit(v));
+		showMenu(wrap, wrap.options, wrap.menuCurrent != null ? wrap.menuCurrent : wrap.current, v => commit(v));
 	});
 	wrap.input = input;
 	wrap.set = (value, options, opts = {}) => {
 		wrap.current = value;
+		wrap.menuCurrent = opts.menuCurrent;   // what the menu highlights, if not the shown value
 		wrap.options = options || [];
 		wrap.classList.toggle('noopts', !wrap.options.length);
 		wrap.classList.toggle('disabled', !!opts.disabled);
@@ -342,9 +343,10 @@ function lensOptions(cams) {
 	const main = cams.map(c => c.lensMain).find(Boolean);
 	if (cams.length === 1 && typeof opts[0] === 'object') {
 		// the phone's own lens list: pick a physical lens by id
+		// highlighted by lens id (menuCurrent), since two lenses can share a focal length
 		return [{ header: 'Lenses' }, ...opts.map(o => o.facing === 'front'
-			? { value: o.value, label: 'Front', suffix: o.mm + ' mm', match: 'Front' }
-			: { value: o.value, label: o.mm + ' mm', suffix: o.zoom || (main ? zoomFactor(o.mm, main) : ''), match: o.mm })];
+			? { value: o.value, label: o.label || 'Front', suffix: o.mm + ' mm' + (o.zoom ? ' · ' + o.zoom : '') }
+			: { value: o.value, label: o.label || o.mm + ' mm', suffix: o.zoom || (main ? zoomFactor(o.mm, main) : '') })];
 	}
 	// several cameras (global row) or phones without a lens list: focal lengths in mm
 	const zoomOf = {};
@@ -475,7 +477,7 @@ function buildRow(cam) {
 		const c = combo(p, v => {
 			if (p === 'letter') v = v.toUpperCase();
 			const lens = p === 'lens' && (r.cam.lensOptions || []).find(o => typeof o === 'object' && o.value === v);
-			markPending(cam.id, p, lens ? (lens.facing === 'front' ? 'Front' : lens.mm) : v);
+			markPending(cam.id, p, lens ? (lens.facing === 'front' ? (lens.label || 'Front') : lens.mm) : v);
 			act('/cameras/' + cam.id + '/set', { param: p, value: v });
 		});
 		r.ctl[p] = c;
@@ -818,7 +820,8 @@ function renderRow(r, cam) {
 		} else if (p === 'iris' && cam.irisAuto) {
 			title = 'Iris is currently set by auto exposure';
 		}
-		c.set(pend ? pend.value : cam[p], optionsFor(p, cam), { pending: !!pend, disabled, title, showValue });
+		c.set(pend ? pend.value : cam[p], optionsFor(p, cam), { pending: !!pend, disabled, title, showValue,
+			menuCurrent: p === 'lens' ? cam.lensId : undefined });
 	}
 	const fmtLabel = formatLabel(cam);
 	r.fmtMain.textContent = fmtLabel || (cam.online ? '…' : '–');

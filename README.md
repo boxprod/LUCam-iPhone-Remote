@@ -229,7 +229,11 @@ Tested on an iPhone 15 Pro with app 3.5.3:
   Front on a 15 Pro. Picking one switches the lens with
   `PUT /lens/cameras/active {"id": "Lens77mm"}`. Typing a focal length, or
   setting it in the global row, selects the back lens with that focal length,
-  so one value works across different iPhone models. For cameras without a
+  so one value works across different iPhone models. Lens IDs aren't
+  reliable names (an iPhone 17 Pro Max reports its 100 mm 4× lens as
+  `Lens77mm`), so the list goes by the phone's focal length and zoom factor.
+  Phones with two front lenses get distinct names such as "Front ultra wide"
+  and "Front". For cameras without a
   lens list, Lens falls back to `/lens/zoom` and the per-model table
   `NATIVE_LENSES_MM` in `python/lucam/manager.py`.
 - **Iris.** The Iris column offers third-stop f-numbers within the range

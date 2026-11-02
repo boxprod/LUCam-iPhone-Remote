@@ -14,11 +14,22 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = '/control/api/v1'
+# The lens list an iPhone 17 Pro Max reports (two front lenses, '77mm' id at 100 mm).
+LENSES = [
+	{'id': 'Lens13mm', 'focalLength': 13, 'zoomFactor': '0.5x', 'facing': 'back'},
+	{'id': 'Lens24mm', 'focalLength': 24, 'zoomFactor': '1x', 'facing': 'back'},
+	{'id': 'LensWASecondary', 'focalLength': 48, 'zoomFactor': '2x', 'facing': 'back'},
+	{'id': 'Lens77mm', 'focalLength': 100, 'zoomFactor': '4x', 'facing': 'back'},
+	{'id': 'Lens200mm', 'focalLength': 200, 'zoomFactor': '8x', 'facing': 'back'},
+	{'id': 'LensFrontUltraWide', 'focalLength': 19, 'zoomFactor': '0.5x', 'facing': 'front'},
+	{'id': 'LensFront', 'focalLength': 19, 'zoomFactor': '0.5x', 'facing': 'front'},
+]
 CODECS = ['Apple ProRes 422 HQ:Default', 'Apple ProRes 422:Default', 'HEVC (H.265):High', 'H.264:High', 'H.264:Medium']
 
 
 def make_state(name, iris_controllable=True):
 	return {
+		'activeLens': 'Lens24mm',
 		'iris': 2.8 if iris_controllable else 1.78,
 		'irisControllable': iris_controllable,
 		'product': {'deviceName': name, 'productName': 'Blackmagic Camera (iPhone, simulated)', 'softwareVersion': '3.5.3'},
@@ -91,6 +102,9 @@ def make_handler(state, lock, verbose):
 					'/video/whiteBalanceTint': {'whiteBalanceTint': s['tint']},
 					'/video/whiteBalanceTint/description': {'whiteBalanceTint': {'min': -50, 'max': 50}},
 					'/lens/zoom': {'focalLength': s['zoom'], 'normalised': 0.1},
+					'/lens/cameras': {'cameras': [dict(l, index=i, isAvailable=True, isActive=l['id'] == s['activeLens'])
+												 for i, l in enumerate(LENSES)]},
+					'/lens/cameras/active': dict(next(l for l in LENSES if l['id'] == s['activeLens']), isActive=True, isAvailable=True),
 					'/lens/iris': {'apertureStop': s['iris'], 'continuousApertureAutoExposure': False},
 					'/lens/iris/description': {'controllable': s['irisControllable'],
 											   'apertureStop': {'min': 1.6, 'max': 8.0} if s['irisControllable'] else {'min': 1.78, 'max': 1.78}},
@@ -147,6 +161,12 @@ def make_handler(state, lock, verbose):
 					if s['recording']:
 						return self._send(409, {'error': 'cannot change format while recording'})
 					s['format'].update(body)
+				elif p == '/lens/cameras/active':
+					lens = next((l for l in LENSES if l['id'] == body.get('id')), None)
+					if lens is None:
+						return self._send(400, {'error': 'unknown lens'})
+					s['activeLens'] = lens['id']
+					s['zoom'] = lens['focalLength']
 				elif p == '/lens/iris':
 					if not s['irisControllable']:
 						return self._send(403, {'error': 'lens iris is not controllable'})

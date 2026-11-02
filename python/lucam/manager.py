@@ -24,6 +24,26 @@ F_STOPS = (1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5,
 		   6.3, 7.1, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0)
 
 
+def lens_names(lenses):
+	"""{lens id: name}. Back lenses go by focal length ('24 mm' is shown from
+	mm, so they get it here too); front lenses get a name from their id
+	('LensFront' -> 'Front', 'LensFrontUltraWide' -> 'Front ultra wide'), made
+	unique when two would read the same."""
+	names = {}
+	for l in lenses:
+		if l.get('facing') == 'front':
+			words = re.findall(r'[A-Z][a-z]+|[A-Z]+(?![a-z])|\d+', re.sub(r'^Lens', '', l['id'])) or ['Front']
+			name = ' '.join([words[0]] + [w.lower() for w in words[1:]])
+			if not name.lower().startswith('front'):
+				name = 'Front ' + name.lower()
+		else:
+			name = '{} mm'.format(l.get('focalLength'))
+		if name in names.values():
+			name = '{} ({})'.format(name, sum(1 for n in names.values() if n.startswith(name)) + 1)
+		names[l['id']] = name
+	return names
+
+
 def format_f_stop(value):
 	"""1.78 -> 'f/1.78', 2.0 -> 'f/2', 2.8 -> 'f/2.8'"""
 	return 'f/{}'.format(('%.2f' % float(value)).rstrip('0').rstrip('.'))
@@ -406,8 +426,9 @@ class CameraWorker(threading.Thread):
 			# The phone's own lens list: switching selects the physical lens.
 			back = sorted((l for l in self._lenses if l.get('facing') != 'front'), key=lambda l: l.get('focalLength', 0))
 			front = [l for l in self._lenses if l.get('facing') == 'front']
+			names = lens_names(back + front)
 			upd['lensOptions'] = [{'value': l['id'], 'mm': l.get('focalLength'), 'zoom': (l.get('zoomFactor') or '').replace('x', '×'),
-								   'facing': l.get('facing', 'back')} for l in back + front]
+								   'facing': l.get('facing', 'back'), 'label': names[l['id']]} for l in back + front]
 			upd['lensNative'] = True
 			upd['lensMain'] = next((l.get('focalLength') for l in back if l.get('zoomFactor') == '1x'), None)
 			if fl.get('min') is not None:
@@ -486,7 +507,7 @@ class CameraWorker(threading.Thread):
 			if active:
 				upd['lensId'] = active.get('id')
 				if active.get('facing') == 'front':
-					upd['lens'] = 'Front'
+					upd['lens'] = lens_names(self._lenses).get(active.get('id'), 'Front')
 		sl = self._try('slate', c.slate)
 		if sl:
 			upd['letter'] = (sl.get('project') or {}).get('camera')
@@ -803,14 +824,16 @@ class CameraWorker(threading.Thread):
 		c = self.client
 		value = str(value).strip()
 		lens = next((l for l in self._lenses if l['id'] == value), None)
-		if lens is None and value.lower() == 'front':
-			lens = next((l for l in self._lenses if l.get('facing') == 'front'), None)
+		if lens is None:   # a lens name: 'Front', 'Front ultra wide'...
+			names = lens_names(self._lenses)
+			lens = next((l for l in self._lenses if names[l['id']].lower() == value.lower()), None)
 		if lens is None and self._lenses:
 			mm = float(value.lower().replace('mm', ''))
 			lens = next((l for l in self._lenses if l.get('facing') != 'front' and l.get('focalLength') == mm), None)
 		if lens is not None:
 			c.set_active_lens(lens['id'])
-			self._update(lensId=lens['id'], lens='Front' if lens.get('facing') == 'front' else lens.get('focalLength'))
+			self._update(lensId=lens['id'], lens=lens_names(self._lenses)[lens['id']] if lens.get('facing') == 'front'
+						 else lens.get('focalLength'))
 		else:
 			mm = int(float(value.lower().replace('mm', '')))
 			c.set_focal_length(mm)
