@@ -17,8 +17,10 @@ ROOT = '/control/api/v1'
 CODECS = ['Apple ProRes 422 HQ:Default', 'Apple ProRes 422:Default', 'HEVC (H.265):High', 'H.264:High', 'H.264:Medium']
 
 
-def make_state(name):
+def make_state(name, iris_controllable=True):
 	return {
+		'iris': 2.8 if iris_controllable else 1.78,
+		'irisControllable': iris_controllable,
 		'product': {'deviceName': name, 'productName': 'Blackmagic Camera (iPhone, simulated)', 'softwareVersion': '3.5.3'},
 		'recording': False,
 		'recStart': 0,
@@ -89,6 +91,9 @@ def make_handler(state, lock, verbose):
 					'/video/whiteBalanceTint': {'whiteBalanceTint': s['tint']},
 					'/video/whiteBalanceTint/description': {'whiteBalanceTint': {'min': -50, 'max': 50}},
 					'/lens/zoom': {'focalLength': s['zoom'], 'normalised': 0.1},
+					'/lens/iris': {'apertureStop': s['iris'], 'continuousApertureAutoExposure': False},
+					'/lens/iris/description': {'controllable': s['irisControllable'],
+											   'apertureStop': {'min': 1.6, 'max': 8.0} if s['irisControllable'] else {'min': 1.78, 'max': 1.78}},
 					'/lens/zoom/description': {'controllable': True, 'focalLength': {'adjustable': True, 'min': 13, 'max': 120}},
 					'/slates/nextClip': s['slate'],
 					'/livestreams/0': {'status': s['stream'], 'bitrate': 0, 'effectiveVideoFormat': '1080p25'},
@@ -142,6 +147,12 @@ def make_handler(state, lock, verbose):
 					if s['recording']:
 						return self._send(409, {'error': 'cannot change format while recording'})
 					s['format'].update(body)
+				elif p == '/lens/iris':
+					if not s['irisControllable']:
+						return self._send(403, {'error': 'lens iris is not controllable'})
+					if not 1.6 <= body.get('apertureStop', 0) <= 8.0:
+						return self._send(400, {'error': 'out of range'})
+					s['iris'] = body['apertureStop']
 				elif p == '/lens/zoom':
 					s['zoom'] = max(13, min(120, body.get('focalLength', s['zoom'])))
 				elif p == '/slates/nextClip':
@@ -171,7 +182,8 @@ def main():
 	for i in range(args.count):
 		port = args.base_port + i
 		name = 'Mock iPhone {}'.format(chr(ord('A') + i))
-		server = ThreadingHTTPServer(('0.0.0.0', port), make_handler(make_state(name), threading.Lock(), args.verbose))
+		# even-numbered mocks have an adjustable iris, odd ones a fixed f/1.78 like most iPhones
+		server = ThreadingHTTPServer(('0.0.0.0', port), make_handler(make_state(name, i % 2 == 0), threading.Lock(), args.verbose))
 		threading.Thread(target=server.serve_forever, daemon=True).start()
 		print('{} on http://127.0.0.1:{}'.format(name, port), flush=True)
 		if args.bonjour:

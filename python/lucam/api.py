@@ -230,6 +230,17 @@ class CameraClient:
 	def zoom_description(self):
 		return self.get('/lens/zoom/description') or {}
 
+	def iris(self):
+		"""{'apertureStop': 1.78, 'continuousApertureAutoExposure': False, ...}"""
+		return self.get('/lens/iris') or {}
+
+	def iris_description(self):
+		"""{'controllable': bool, 'apertureStop': {'min': f, 'max': f}}"""
+		return self.get('/lens/iris/description') or {}
+
+	def set_iris(self, f_stop):
+		self.put('/lens/iris', {'apertureStop': float(f_stop)})
+
 	def set_focal_length(self, mm):
 		self.put('/lens/zoom', {'focalLength': int(mm)})
 

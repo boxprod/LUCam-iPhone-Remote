@@ -4,7 +4,7 @@ Control several iPhones running **Blackmagic Camera** (app 3.4 or later) from a
 web page, through the app's REST API (`/control/api/v1`).
 
 - Add cameras by IP/hostname, or find them with Bonjour discovery or a subnet scan
-- Per camera: Lens, ISO, FPS, Shutter, White Balance, Tint, Camera letter, Reel,
+- Per camera: Lens, Iris, ISO, FPS, Shutter, White Balance, Tint, Camera letter, Reel,
   and recording Format (codec, resolution, colour space)
 - **Global row**: one value is pushed to every *armed* camera and overrides its own value
 - REC / STOP per camera, plus REC ALL / STOP ALL (fired in parallel so all cameras start together)
@@ -232,6 +232,13 @@ Tested on an iPhone 15 Pro with app 3.5.3:
   so one value works across different iPhone models. For cameras without a
   lens list, Lens falls back to `/lens/zoom` and the per-model table
   `NATIVE_LENSES_MM` in `python/lucam/manager.py`.
+- **Iris.** The Iris column offers third-stop f-numbers within the range
+  from `/lens/iris/description`. A value can also be typed ("2.8", "f/2.8").
+  iPhones with a fixed aperture (an iPhone 15 Pro and a 17 Pro Max were tested)
+  report `controllable: false`, so their Iris shows the f-number (f/1.78)
+  greyed out. The global Iris only goes to armed cameras whose iris is
+  adjustable. Adjustable iris is so far tested only on the simulator (camera
+  A of `tools/mock_camera.py`), not on a real iPhone.
 - **Focus.** `/lens/focus` (normalised 0–1) and `PUT /lens/focus/doAutoFocus`
   are documented. Continuous autofocus is the undocumented
   `/lens/focus/autoFocus`: `{"enabled": true, "mode": "Continuous"}` for on,

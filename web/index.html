@@ -18,7 +18,7 @@
 	--rec: #e8322b;
 	--rec-dim: #5a1714;
 	--radius: 6px;
-	--cols: 34px minmax(190px, 1.6fr) 62px 66px 150px 86px 86px 86px 92px 112px 92px minmax(112px, .9fr) 92px 64px;
+	--cols: 34px minmax(190px, 1.6fr) 62px 66px 150px 86px 80px 86px 86px 92px 112px 92px minmax(112px, .9fr) 92px 64px;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--text); }
@@ -53,7 +53,7 @@ a.btn { text-decoration: none; color: var(--text); }
 .btn.stop { min-width: 84px; font-weight: 700; letter-spacing: .06em; }
 
 main { padding: 12px 16px 40px; }
-.table { min-width: 1240px; }
+.table { min-width: 1330px; }
 .scroll { overflow-x: auto; }
 .row { display: grid; grid-template-columns: var(--cols); gap: 8px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 6px; }
 .row.head { background: none; border: none; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding-top: 0; padding-bottom: 2px; margin-bottom: 2px; }
@@ -177,7 +177,7 @@ main { padding: 12px 16px 40px; }
 	<div class="scroll">
 		<div class="table">
 			<div class="row head">
-				<div></div><div>Camera</div><div>Cam</div><div>Reel</div><div>Format</div><div>Lens mm</div><div>ISO</div><div>FPS</div><div>Shutter</div><div>WB K</div><div>Tint</div><div>Timecode / clip</div><div></div><div></div>
+				<div></div><div>Camera</div><div>Cam</div><div>Reel</div><div>Format</div><div>Lens mm</div><div>Iris</div><div>ISO</div><div>FPS</div><div>Shutter</div><div>WB K</div><div>Tint</div><div>Timecode / clip</div><div></div><div></div>
 			</div>
 			<div class="row global" id="globalRow"></div>
 			<div id="camRows"></div>
@@ -221,13 +221,14 @@ const PARAMS = {
 	letter: { width: 'letter', text: true },
 	reel:   { step: 1 },
 	lens:   { step: 1, opts: 'lensOptions' },
+	iris:   { opts: 'irisOptions' },
 	iso:    { opts: 'isoOptions' },
 	fps:    { opts: 'fpsOptions' },
 	shutter:{ opts: 'shutterOptions' },
 	wb:     { step: 100, presets: [2700, 3200, 4000, 4300, 5000, 5600, 6500, 7500] },
 	tint:   { step: 1, presets: [-20, -10, 0, 10, 20] },
 };
-const GLOBAL_PARAMS = ['reel', 'lens', 'iso', 'fps', 'shutter', 'wb', 'tint'];
+const GLOBAL_PARAMS = ['reel', 'lens', 'iris', 'iso', 'fps', 'shutter', 'wb', 'tint'];
 const UNSUPPORTED_KEY = { letter: 'slate', reel: 'slate' };
 
 let state = { cameras: [], global: {}, discovery: { results: [] } };
@@ -322,7 +323,7 @@ function combo(param, onCommit) {
 		wrap.classList.toggle('noopts', !wrap.options.length);
 		wrap.classList.toggle('disabled', !!opts.disabled);
 		wrap.classList.toggle('pending', !!opts.pending);
-		if (document.activeElement !== input) input.value = opts.disabled ? '–' : fmt(value);
+		if (document.activeElement !== input) input.value = opts.disabled && !opts.showValue ? '–' : fmt(value);
 		input.title = opts.title || '';
 	};
 	return wrap;
@@ -405,12 +406,9 @@ function unionOptions(param, cams) {
 	const seen = new Map();
 	for (const c of cams) for (const o of optionsFor(param, c)) if (!seen.has(String(o))) seen.set(String(o), o);
 	const vals = [...seen.values()];
-	if (vals.every(v => !isNaN(parseFloat(String(v).replace('1/', ''))))) {
-		vals.sort((a, b) => {
-			const n = x => String(x).startsWith('1/') ? 1 / parseFloat(String(x).slice(2)) : parseFloat(x);
-			return n(a) - n(b);
-		});
-	}
+	// numbers, shutter speeds (1/50) and f-stops (f/2.8) sort by value
+	const n = x => { const t = String(x); return t.startsWith('1/') ? 1 / parseFloat(t.slice(2)) : parseFloat(t.replace(/^f\//, '')); };
+	if (vals.every(v => !isNaN(n(v)))) vals.sort((a, b) => n(a) - n(b));
 	return vals;
 }
 
@@ -423,6 +421,17 @@ function renderGlobal() {
 	for (const p of GLOBAL_PARAMS) {
 		const vals = armed.map(c => c[p]).filter(v => v !== null && v !== undefined);
 		const allSame = vals.length && vals.every(v => same(v, vals[0]));
+		if (p === 'iris') {
+			// only cameras with a controllable iris take part
+			const irisCams = armed.filter(c => c.irisControllable);
+			const iv = irisCams.map(c => c.iris).filter(v => v != null);
+			const same1 = iv.length && iv.every(v => same(v, iv[0]));
+			g.iris.set(same1 ? iv[0] : '', unionOptions('iris', irisCams), {
+				disabled: !irisCams.length,
+				title: irisCams.length ? 'Sets the iris on armed cameras that have an adjustable aperture' : 'No armed camera has an adjustable aperture' });
+			g.iris.input.placeholder = iv.length && !same1 ? 'mixed' : '—';
+			continue;
+		}
 		g[p].set(allSame ? vals[0] : (vals.length ? '' : ''), unionOptions(p, armed), { title: allSame ? '' : 'Mixed values — type or pick one to override all armed cameras' });
 		g[p].input.placeholder = vals.length && !allSame ? 'mixed' : '—';
 	}
@@ -462,7 +471,7 @@ function buildRow(cam) {
 	r.err = el('div', 'err');
 	name.append(top, r.meta, r.err);
 	r.el.append(r.arm, name);
-	for (const p of ['letter', 'reel', 'lens', 'iso', 'fps', 'shutter', 'wb', 'tint']) {
+	for (const p of ['letter', 'reel', 'lens', 'iris', 'iso', 'fps', 'shutter', 'wb', 'tint']) {
 		const c = combo(p, v => {
 			if (p === 'letter') v = v.toUpperCase();
 			const lens = p === 'lens' && (r.cam.lensOptions || []).find(o => typeof o === 'object' && o.value === v);
@@ -799,9 +808,17 @@ function renderRow(r, cam) {
 	for (const [p, c] of Object.entries(r.ctl)) {
 		const pend = pendingFor(cam, p);
 		const key = UNSUPPORTED_KEY[p] || p;
-		const disabled = unsupported.has(key) || (!cam.online && cam[p] == null);
-		const title = unsupported.has(key) ? 'Not supported by this camera' : '';
-		c.set(pend ? pend.value : cam[p], optionsFor(p, cam), { pending: !!pend, disabled, title });
+		let disabled = unsupported.has(key) || (!cam.online && cam[p] == null);
+		let title = unsupported.has(key) ? 'Not supported by this camera' : '';
+		let showValue = false;
+		if (p === 'iris' && !disabled && !cam.irisControllable) {
+			// fixed-aperture iPhones still report their f-number
+			disabled = true; showValue = true;
+			title = 'Fixed aperture on this camera' + (cam.iris ? ' (' + cam.iris + ')' : '');
+		} else if (p === 'iris' && cam.irisAuto) {
+			title = 'Iris is currently set by auto exposure';
+		}
+		c.set(pend ? pend.value : cam[p], optionsFor(p, cam), { pending: !!pend, disabled, title, showValue });
 	}
 	const fmtLabel = formatLabel(cam);
 	r.fmtMain.textContent = fmtLabel || (cam.online ? '…' : '–');

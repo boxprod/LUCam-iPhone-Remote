@@ -17,7 +17,26 @@ import uuid
 from . import api, discovery, livestream
 
 PARAMS = ('lens', 'iso', 'fps', 'shutter', 'wb', 'tint', 'letter', 'reel', 'codec', 'resolution', 'colorspace',
-		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut')
+		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut', 'iris')
+
+# Third-stop f-numbers offered for the iris, filtered to each camera's range.
+F_STOPS = (1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6,
+		   6.3, 7.1, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0)
+
+
+def format_f_stop(value):
+	"""1.78 -> 'f/1.78', 2.0 -> 'f/2', 2.8 -> 'f/2.8'"""
+	return 'f/{}'.format(('%.2f' % float(value)).rstrip('0').rstrip('.'))
+
+
+def parse_f_stop(value):
+	"""'f/2.8', 'F2.8', '2.8' -> 2.8"""
+	s = str(value).strip().lower().replace(' ', '')
+	for prefix in ('f/', 't/', 'f', 't'):
+		if s.startswith(prefix):
+			s = s[len(prefix):]
+			break
+	return float(s)
 FOCUS_PARAMS = ('focus', 'autofocus', 'focusonce')   # refused while a camera's focus is locked
 
 # Recording format used while a camera is in live view: the app only streams
@@ -124,6 +143,7 @@ class CameraWorker(threading.Thread):
 		self._supported = []
 		self._lenses = []
 		self._lut_displays = []
+		self._iris_controllable = False
 		self._device_format = None
 		self._device_dr = None
 		# Until one answers, cycle through the variants of what the user typed
@@ -159,6 +179,7 @@ class CameraWorker(threading.Thread):
 			'streaming': None, 'streamBitrate': 0, 'liveOurs': False, 'livePath': None, 'liveWarning': None,
 			'lens': None, 'lensOptions': [], 'lensRange': None, 'lensNative': False, 'lensMain': None,
 			'lensId': None,
+			'iris': None, 'irisOptions': [], 'irisControllable': False, 'irisAuto': False,
 			'focus': None, 'focusControllable': False, 'autofocus': None, 'autofocusSupported': False,
 			'focusLocked': bool(focus_locked),
 			'displayLuts': {},   # {'Device': False, 'HDMI': True}: display LUT on/off per display
@@ -365,6 +386,16 @@ class CameraWorker(threading.Thread):
 			except api.ApiError as e:
 				if e.status == 0:
 					raise
+		idesc = self._try('iris', c.iris_description) or {}
+		self._iris_controllable = bool(idesc.get('controllable'))
+		rng = idesc.get('apertureStop') or {}
+		lo, hi = rng.get('min'), rng.get('max')
+		if self._iris_controllable and lo is not None and hi is not None:
+			stops = sorted({round(lo, 2), round(hi, 2)} | {f for f in F_STOPS if lo - 0.01 <= f <= hi + 0.01})
+			upd['irisOptions'] = [format_f_stop(f) for f in stops]
+		else:
+			upd['irisOptions'] = []
+		upd['irisControllable'] = self._iris_controllable
 		fd = self._try('focus', c.get, '/lens/focus/description') or {}
 		upd['focusControllable'] = bool(fd.get('controllable'))
 		lenses = self._try('lenscams', c.lens_cameras)
@@ -443,6 +474,10 @@ class CameraWorker(threading.Thread):
 		if af:
 			upd['autofocusSupported'] = bool(af.get('supported', True))
 			upd['autofocus'] = 'Continuous' if af.get('enabled') and af.get('mode') == 'Continuous' else 'Off'
+		ir = self._try('iris', c.iris)
+		if ir and ir.get('apertureStop') is not None:
+			upd['iris'] = format_f_stop(ir['apertureStop'])
+			upd['irisAuto'] = bool(ir.get('continuousApertureAutoExposure'))
 		z = self._try('lens', c.zoom)
 		if z:
 			upd['lens'] = z.get('focalLength')
@@ -740,6 +775,17 @@ class CameraWorker(threading.Thread):
 			self._update(tint=int(float(value)))
 		elif param in ('fps', 'codec', 'resolution', 'colorspace'):
 			self._set_format_param(param, value)
+		elif param == 'iris':
+			if not self._iris_controllable:
+				raise api.ApiError(0, 'this camera has a fixed aperture')
+			f_stop = parse_f_stop(value)
+			try:
+				c.set_iris(f_stop)
+			except api.ApiError as e:
+				if e.status == 403:
+					raise api.ApiError(403, 'iris is set by auto exposure, or not controllable right now')
+				raise
+			self._update(iris=format_f_stop(f_stop))
 		elif param == 'lens':
 			self._set_lens(value)
 		elif param == 'letter':
@@ -919,8 +965,11 @@ class CameraManager:
 			raise ValueError('unknown parameter ' + str(param))
 		with self.lock:
 			self.global_values[param] = value
+			# a fixed-aperture camera just keeps its iris
+			skip = {k for k, w in self.workers.items() if param == 'iris' and not w.state.get('irisControllable')}
 		for cam_id in self.active_ids():
-			self.set_param(cam_id, param, value)
+			if cam_id not in skip:
+				self.set_param(cam_id, param, value)
 		self._save_later()
 
 	def auto_wb(self, cam_ids):
