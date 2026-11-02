@@ -212,6 +212,13 @@ class CameraClient:
 	def auto_white_balance(self):
 		self.put('/video/whiteBalance/doAuto')
 
+	def auto_exposure(self):
+		"""{'mode': 'Off'|'Continuous'|'OneShot', 'type': ...}"""
+		return self.get('/video/autoExposure') or {}
+
+	def set_auto_exposure(self, mode):
+		self.put('/video/autoExposure', {'mode': mode})
+
 	def tint(self):
 		return (self.get('/video/whiteBalanceTint') or {}).get('whiteBalanceTint')
 
@@ -321,6 +328,13 @@ class CameraClient:
 
 	def set_active_lens(self, lens_id):
 		self.put('/lens/cameras/active', {'id': str(lens_id)})
+
+	def auto_lens(self):
+		"""Automatic lens switching: {'supported': bool, 'enabled': bool}"""
+		return self.get('/lens/cameras/auto') or {}
+
+	def set_auto_lens(self, enabled):
+		self.put('/lens/cameras/auto', {'enabled': bool(enabled)})
 
 	# --- slate --------------------------------------------------------------
 

@@ -148,7 +148,7 @@ class CameraWorker(threading.Thread):
 	RETRY_OFFLINE = 2.0
 
 	def __init__(self, manager, cam_id, address, name='', active=True, live_mode=False, saved_format=None,
-				 focus_locked=False):
+				 focus_locked=False, wb_hold=None):
 		super().__init__(name='lucam-' + cam_id, daemon=True)
 		self.manager = manager
 		# Live mode: the camera temporarily records H.264 1080p so it can stream;
@@ -157,6 +157,11 @@ class CameraWorker(threading.Thread):
 		# Focus lock is ours (the app has no lock setting): AF off, and focus
 		# commands refused until unlocked. Saved in cameras.json.
 		self.focus_locked = bool(focus_locked)
+		# White balance lock is ours too: the API has no auto-WB switch, so the
+		# last WB/tint set from here is held and restored if the phone changes it.
+		# Auto WB or applying a preset releases it. Saved in cameras.json.
+		self.wb_hold = {k: v for k, v in (wb_hold or {}).items() if k in ('wb', 'tint') and v is not None}
+		self._wb_restores = 0
 		self._focus_target = None   # latest slider value; older ones are dropped
 		self.saved_format = saved_format if self.live_mode else None
 		self._format_lock = threading.Lock()
@@ -209,7 +214,7 @@ class CameraWorker(threading.Thread):
 			'colorspace': None, 'colorspaceOptions': [],
 			'liveMode': self.live_mode, 'deviceFormat': None,
 			'shutter': None, 'shutterMode': None, 'shutterOptions': [],
-			'wb': None, 'wbRange': None,
+			'wb': None, 'wbRange': None, 'wbHold': dict(self.wb_hold),
 			'tint': None, 'tintRange': None,
 			'letter': None, 'reel': None, 'clipName': None,
 			'unsupported': [],
@@ -473,6 +478,7 @@ class CameraWorker(threading.Thread):
 		v = self._try('tint', c.tint)
 		if v is not None:
 			upd['tint'] = v
+		self._restore_wb(upd)
 		fmt = self._try('fps', c.format)
 		if fmt:
 			fr = fmt.get('frameRate')
@@ -719,6 +725,7 @@ class CameraWorker(threading.Thread):
 			elif kind == 'autowb':
 				label = 'auto WB'
 				c.auto_white_balance()
+				self.release_wb_hold()
 				self._next_full = 0
 			elif kind == 'stream':
 				label = 'live view'
@@ -780,6 +787,7 @@ class CameraWorker(threading.Thread):
 			self._update(focusLocked=lock)
 			self.manager._save_later()
 		elif param == 'iso':
+			self._lock_exposure()
 			c.set_iso(int(float(value)))
 			self._update(iso=int(float(value)))
 		elif param == 'shutter':
@@ -787,19 +795,21 @@ class CameraWorker(threading.Thread):
 			angle = parsed.get('angle')
 			if angle is not None:
 				angle *= self._angle_scale
+			self._lock_exposure()
 			c.set_shutter(speed=parsed.get('speed'), angle=angle)
 		elif param == 'wb':
 			c.set_white_balance(int(float(value)))
-			self._update(wb=int(float(value)))
+			self._hold_wb('wb', int(float(value)))
 		elif param == 'tint':
 			c.set_tint(int(float(value)))
-			self._update(tint=int(float(value)))
+			self._hold_wb('tint', int(float(value)))
 		elif param in ('fps', 'codec', 'resolution', 'colorspace'):
 			self._set_format_param(param, value)
 		elif param == 'iris':
 			if not self._iris_controllable:
 				raise api.ApiError(0, 'this camera has a fixed aperture')
 			f_stop = parse_f_stop(value)
+			self._lock_exposure()   # the phone refuses iris changes under auto exposure
 			try:
 				c.set_iris(f_stop)
 			except api.ApiError as e:
@@ -818,6 +828,80 @@ class CameraWorker(threading.Thread):
 		else:
 			raise ValueError('unknown parameter ' + param)
 
+	# --- locks: a value set from here stays put -----------------------------------
+
+	def _lock(self, what, fn):
+		"""Best effort: the value itself is set either way."""
+		try:
+			fn()
+		except api.ApiError as e:
+			if e.status == 0:
+				raise
+			self._error('could not lock {} ({})'.format(what, e))
+
+	def _lock_exposure(self):
+		"""Auto exposure off, so ISO, shutter and iris keep the values set from here.
+		(App 3.5 already drops AE when ISO or shutter is set; iris is refused under AE.)"""
+		def off():
+			ae = self._try('autoexposure', self.client.auto_exposure)
+			if ae and ae.get('mode') not in (None, 'Off'):
+				self.client.set_auto_exposure('Off')
+				self._update(irisAuto=False)
+		self._lock('exposure', off)
+
+	def _lock_lens(self):
+		"""Automatic lens switching off, so the phone stays on the lens picked here."""
+		def off():
+			al = self._try('autolens', self.client.auto_lens)
+			if al and al.get('supported') and al.get('enabled'):
+				self.client.set_auto_lens(False)
+		self._lock('lens', off)
+
+	def _hold_wb(self, key, value):
+		# hold what the phone actually took (it may clamp)
+		read = self._try(key, self.client.white_balance if key == 'wb' else self.client.tint)
+		held = read if read is not None else value
+		self.wb_hold[key] = held
+		self._wb_restores = 0
+		self._update(**{key: held, 'wbHold': dict(self.wb_hold)})
+		self.manager._save_later()
+
+	def release_wb_hold(self):
+		if self.wb_hold:
+			self.wb_hold = {}
+			self._update(wbHold={})
+			self.manager._save_later()
+
+	def _restore_wb(self, upd):
+		"""Put back a held WB/tint the phone has changed (auto WB, someone on the phone)."""
+		drifted = False
+		for key, setter, getter in (('wb', self.client.set_white_balance, self.client.white_balance),
+									('tint', self.client.set_tint, self.client.tint)):
+			held, now = self.wb_hold.get(key), upd.get(key)
+			if held is None or now is None or now == held:
+				continue
+			drifted = True
+			try:
+				setter(held)
+				upd[key] = getter()
+			except api.ApiError as e:
+				if e.status == 0:
+					raise
+				self._error('could not restore held {} ({})'.format(key, e))
+				continue
+			if upd[key] != held:   # the phone won't take it any more: hold what it has
+				self.wb_hold[key] = upd[key]
+				self.manager._save_later()
+			self.manager._log('{}: {} changed on the phone ({} -> {}), restored'.format(
+				self.state['name'] or self.state['address'], 'white balance' if key == 'wb' else 'tint', held, now))
+		if drifted:
+			self._wb_restores += 1
+			if self._wb_restores == 3:
+				self._error('white balance keeps changing on the phone: turn off auto white balance in the app')
+		else:
+			self._wb_restores = 0
+		upd['wbHold'] = dict(self.wb_hold)
+
 	def _set_lens(self, value):
 		"""A lens id from the phone's list, or a focal length in mm: picks the
 		back lens with that focal length, else zooms (phones without /lens/cameras)."""
@@ -831,6 +915,7 @@ class CameraWorker(threading.Thread):
 			mm = float(value.lower().replace('mm', ''))
 			lens = next((l for l in self._lenses if l.get('facing') != 'front' and l.get('focalLength') == mm), None)
 		if lens is not None:
+			self._lock_lens()
 			c.set_active_lens(lens['id'])
 			self._update(lensId=lens['id'], lens=lens_names(self._lenses)[lens['id']] if lens.get('facing') == 'front'
 						 else lens.get('focalLength'))
@@ -892,7 +977,8 @@ class CameraManager:
 			try:
 				self._spawn(cam.get('id') or uuid.uuid4().hex[:8], cam['address'],
 							cam.get('name', ''), cam.get('active', True),
-							cam.get('liveMode', False), cam.get('savedFormat'), cam.get('focusLocked', False))
+							cam.get('liveMode', False), cam.get('savedFormat'), cam.get('focusLocked', False),
+						cam.get('wbHold'))
 			except (KeyError, ValueError) as e:
 				self._log('skipping saved camera: {}'.format(e))
 
@@ -905,7 +991,8 @@ class CameraManager:
 							 'address': w.state['address'] if w.resolved else w.typed_address,
 							 'name': w.state['name'], 'active': w.state['active'],
 							 **({'liveMode': True, 'savedFormat': w.saved_format} if w.live_mode else {}),
-							 **({'focusLocked': True} if w.focus_locked else {})}
+							 **({'focusLocked': True} if w.focus_locked else {}),
+						 **({'wbHold': w.wb_hold} if w.wb_hold else {})}
 							for w in self.workers.values()],
 				'global': self.global_values,
 				'settings': self.settings,
@@ -931,8 +1018,9 @@ class CameraManager:
 
 	# --- cameras ------------------------------------------------------------------
 
-	def _spawn(self, cam_id, address, name, active, live_mode=False, saved_format=None, focus_locked=False):
-		w = CameraWorker(self, cam_id, address, name, active, live_mode, saved_format, focus_locked)
+	def _spawn(self, cam_id, address, name, active, live_mode=False, saved_format=None, focus_locked=False,
+			   wb_hold=None):
+		w = CameraWorker(self, cam_id, address, name, active, live_mode, saved_format, focus_locked, wb_hold)
 		with self.lock:
 			self.workers[cam_id] = w
 		w.start()
@@ -1247,6 +1335,8 @@ class CameraManager:
 				if not name or re.search(r'[\x00-\x1f"/:*?<>|\\]', name):
 					raise ValueError('invalid preset name')
 				getattr(client, action + '_preset')(name)
+				if action == 'apply':
+					self._worker(cam_id).release_wb_hold()   # the preset brings its own white balance
 				return as_json(200, {'ok': True})
 			return as_json(404, {'error': 'no route'})
 		except KeyError as e:

@@ -80,6 +80,7 @@ main { padding: 12px 16px 40px; }
 .combo input { width: 100%; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius) 0 0 var(--radius); padding: 5px 6px; text-align: right; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .combo input:focus { outline: none; border-color: var(--accent); }
 .combo.pending input { color: var(--warn); }
+.combo.held input { box-shadow: inset 2px 0 0 var(--accent); }
 .combo.disabled { opacity: .35; pointer-events: none; }
 .combo .drop { border: 1px solid var(--line); border-left: none; background: var(--panel-2); border-radius: 0 var(--radius) var(--radius) 0; width: 20px; padding: 0; cursor: pointer; color: var(--muted); font-size: 10px; }
 .combo .drop:hover { color: var(--text); }
@@ -820,6 +821,9 @@ function renderRow(r, cam) {
 		} else if (p === 'iris' && cam.irisAuto) {
 			title = 'Iris is currently set by auto exposure';
 		}
+		const held = (p === 'wb' || p === 'tint') && cam.wbHold && cam.wbHold[p] != null;
+		if (held) title = 'Held at ' + cam.wbHold[p] + (p === 'wb' ? 'K' : '') + ': restored if the phone changes it (auto WB or a preset releases it)';
+		c.classList.toggle('held', held);
 		c.set(pend ? pend.value : cam[p], optionsFor(p, cam), { pending: !!pend, disabled, title, showValue,
 			menuCurrent: p === 'lens' ? cam.lensId : undefined });
 	}

@@ -36,6 +36,8 @@ def make_state(name, iris_controllable=True):
 		'recording': False,
 		'recStart': 0,
 		'iso': 400,
+		'autoExposure': 'Off',
+		'autoLens': False,
 		'supportedISOs': [50, 100, 200, 400, 800, 1250, 1600, 2000, 3200],
 		'shutterSpeed': 50,
 		'wb': 5600, 'tint': 0,
@@ -94,6 +96,8 @@ def make_handler(state, lock, verbose):
 					'/transports/0/record': {'recording': s['recording']},
 					'/transports/0/timecode': {'display': '00:00:{:02d}:{:02d}'.format(tc_secs // 60 % 60, tc_secs % 60)},
 					'/video/iso': {'iso': s['iso']},
+					'/video/autoExposure': {'mode': s['autoExposure']},
+					'/lens/cameras/auto': {'supported': True, 'enabled': s['autoLens']},
 					'/video/supportedISOs': {'supportedISOs': s['supportedISOs']},
 					'/video/shutter': {'continuousShutterAutoExposure': False, 'shutterSpeed': s['shutterSpeed']},
 					'/video/supportedShutters': {'shutterSpeeds': [24, 25, 30, 48, 50, 60, 100, 120, 200, 250, 500, 1000]},
@@ -105,7 +109,8 @@ def make_handler(state, lock, verbose):
 					'/lens/cameras': {'cameras': [dict(l, index=i, isAvailable=True, isActive=l['id'] == s['activeLens'])
 												 for i, l in enumerate(LENSES)]},
 					'/lens/cameras/active': dict(next(l for l in LENSES if l['id'] == s['activeLens']), isActive=True, isAvailable=True),
-					'/lens/iris': {'apertureStop': s['iris'], 'continuousApertureAutoExposure': False},
+					'/lens/iris': {'apertureStop': s['iris'],
+								   'continuousApertureAutoExposure': s['autoExposure'] != 'Off' and s['irisControllable']},
 					'/lens/iris/description': {'controllable': s['irisControllable'],
 											   'apertureStop': {'min': 1.6, 'max': 8.0} if s['irisControllable'] else {'min': 1.78, 'max': 1.78}},
 					'/lens/zoom/description': {'controllable': True, 'focalLength': {'adjustable': True, 'min': 13, 'max': 120}},
@@ -145,10 +150,18 @@ def make_handler(state, lock, verbose):
 					if body['iso'] not in s['supportedISOs']:
 						return self._send(400, {'error': 'unsupported ISO'})
 					s['iso'] = body['iso']
+					s['autoExposure'] = 'Off'   # like the app: a manual ISO or shutter ends auto exposure
 				elif p == '/video/shutter':
 					if 'shutterSpeed' not in body:
 						return self._send(400, {'error': 'this mock only supports shutter speed'})
 					s['shutterSpeed'] = body['shutterSpeed']
+					s['autoExposure'] = 'Off'
+				elif p == '/video/autoExposure':
+					if body.get('mode') not in ('Off', 'Continuous', 'OneShot'):
+						return self._send(400, {'error': 'bad mode'})
+					s['autoExposure'] = body['mode']
+				elif p == '/lens/cameras/auto':
+					s['autoLens'] = bool(body.get('enabled'))
 				elif p == '/video/whiteBalance':
 					if not 2500 <= body['whiteBalance'] <= 10000:
 						return self._send(400, {'error': 'Invalid white balance temperature'})
@@ -168,7 +181,7 @@ def make_handler(state, lock, verbose):
 					s['activeLens'] = lens['id']
 					s['zoom'] = lens['focalLength']
 				elif p == '/lens/iris':
-					if not s['irisControllable']:
+					if not s['irisControllable'] or s['autoExposure'] != 'Off':
 						return self._send(403, {'error': 'lens iris is not controllable'})
 					if not 1.6 <= body.get('apertureStop', 0) <= 8.0:
 						return self._send(400, {'error': 'out of range'})

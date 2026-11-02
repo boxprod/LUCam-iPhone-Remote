@@ -87,6 +87,14 @@ view and restores any camera that is in live mode.
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.
 - Each value field takes typing + Enter, ↑/↓ to step (Shift ×10), or the ▾ list of values the camera reports as supported.
 - An amber value is still being sent. If the camera rejects it, the field reverts and the error shows under the camera name.
+- Values set from here stay locked, so the phone's automatic modes can't change them (focus has its own lock, below):
+  - **ISO, Shutter, Iris** turn the app's auto exposure off.
+  - **Lens** turns automatic lens switching off, on phones that have it.
+  - **White Balance, Tint**: the API has no auto-WB switch, so the controller
+    holds the value (a mark on the field's left edge) and puts it back if the
+    phone changes it, within about 3 seconds. **Auto white balance** (⋯ menu, or
+    AWB in the global row) or applying a preset releases the hold. The hold is
+    saved in `cameras.json`.
 - **▶** before a camera's name expands its row with focus controls (the
   browser remembers which rows are open):
   - **Focus** slider, 0–100 % on the phone's own scale. Moving it turns
