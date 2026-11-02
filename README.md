@@ -107,6 +107,29 @@ view and restores any camera that is in live mode.
 - Cameras are listed by camera letter (A, B, C…), here and in Multiview. Cameras whose letter isn't known yet (connecting, offline) come last.
 - **⋯** menu: auto white balance, open/stop live view, reconnect, remove.
 
+## Network interfaces
+
+With several network interfaces (Wi-Fi, Ethernet adapters, VPN), use the
+**Network** section at the bottom of the control panel:
+
+- **Auto** (default): discovery searches every network except VPNs. Each
+  camera streams its live view to the address the Mac's routing table uses to
+  reach it.
+- **A specific interface** (for example "Ethernet Adapter (en5) · en5 ·
+  10.0.0.2/24"): discovery searches only that network, with the subnet scan
+  covering its real subnet, at most a /22. Cameras on that network stream their
+  live view to that interface's address. Cameras elsewhere keep using the
+  routed address.
+
+The section also shows the control-panel address to open from other devices,
+and which interface each camera is reached through. A camera on a different
+interface than the selected one is flagged. The choice is saved in
+`cameras.json`. If the selected interface disappears (adapter unplugged),
+discovery reports it until it is back or you pick another one; cameras you
+already added keep working through the routing table. Interface names come
+from macOS (*System Settings → Network*); on other systems the section lists
+plain addresses.
+
 ## Live view (video feed)
 
 ⋯ → **Open live view** on a camera opens a page

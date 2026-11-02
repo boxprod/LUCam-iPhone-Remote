@@ -108,6 +108,13 @@ main { padding: 12px 16px 40px; }
 .found .item .grow { flex: 1; min-width: 0; }
 .found .item .meta { color: var(--muted); font-size: 11px; }
 .hint { color: var(--muted); font-size: 12px; }
+#netPanel select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; min-width: 340px; }
+.netinfo { display: grid; gap: 6px; margin-top: 10px; font-size: 12px; }
+.netinfo > div { display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; }
+.netinfo .k { color: var(--muted); min-width: 230px; }
+#netUrls, #netCams { display: inline-flex; flex-wrap: wrap; gap: 6px 18px; }
+.netinfo a { color: var(--text); }
+.netinfo .warn { color: var(--warn); }
 .empty { text-align: center; padding: 28px; color: var(--muted); border: 1px dashed var(--line); border-radius: var(--radius); }
 
 .toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 6px; z-index: 60; max-width: 420px; }
@@ -190,6 +197,19 @@ main { padding: 12px 16px 40px; }
 			<span class="hint" id="discStatus"></span>
 		</div>
 		<div class="found" id="found"></div>
+	</section>
+
+	<section class="panel" id="netPanel">
+		<h2>Network</h2>
+		<div class="addbar">
+			<select id="netSelect" title="Network interface used for discovery and for the live view address"></select>
+			<button class="btn" id="netRefresh" title="Look for network interfaces again (e.g. after plugging in an adapter)">↻ Refresh</button>
+			<span class="hint" id="netHint"></span>
+		</div>
+		<div class="netinfo">
+			<div><span class="k">Control panel from other devices</span><span id="netUrls"></span></div>
+			<div><span class="k">Cameras reached via</span><span id="netCams"></span></div>
+		</div>
 	</section>
 </main>
 
@@ -894,8 +914,57 @@ function addCam() {
 	api('/cameras/add', { address: a.value, name: n.value }).then(() => { a.value = ''; n.value = ''; }).catch(e => toast(e.message));
 }
 
+// ---------------------------------------------------------------- network interface
+const ifaceLabel = i => i.label + ' · ' + i.name + ' · ' + i.ip + '/' + i.prefix + (i.vpn ? ' (VPN)' : '');
+async function loadNetwork() {
+	let n;
+	try { n = await api('/network'); } catch (e) { return; }
+	const sel = document.getElementById('netSelect');
+	if (document.activeElement !== sel) {
+		const opts = [{ value: 'auto', label: 'Auto: all networks (VPNs skipped for discovery)' }]
+			.concat(n.interfaces.map(i => ({ value: i.name, label: ifaceLabel(i) })));
+		if (!n.selectedConnected) opts.push({ value: n.selected, label: n.selected + ': not connected' });
+		sel.replaceChildren(...opts.map(o => { const e = el('option', '', o.label); e.value = o.value; return e; }));
+		sel.value = n.selected;
+	}
+	const chosen = n.interfaces.find(i => i.name === n.selected);
+	document.getElementById('netHint').textContent = !n.selectedConnected
+		? n.selected + ' is not connected: discovery will fail until it is back, or pick another interface.'
+		: chosen ? 'Discovery searches ' + chosen.network + ' only. Cameras on it stream their live view to ' + chosen.ip + '.'
+		: 'Discovery searches every network except VPNs. Live view uses the address each camera is routed through.';
+	document.getElementById('netHint').className = 'hint' + (n.selectedConnected ? '' : ' warn');
+
+	const port = n.port || location.port || 80;
+	const urlIfaces = chosen ? [chosen] : n.interfaces.filter(i => !i.vpn);
+	const urls = document.getElementById('netUrls');
+	urls.replaceChildren(...urlIfaces.map(i => {
+		const a = el('a', 'mono', 'http://' + i.ip + ':' + port);
+		a.href = 'http://' + i.ip + ':' + port; a.target = '_blank';
+		a.title = i.label + ' (' + i.name + ')';
+		return a;
+	}));
+	if (!urlIfaces.length) urls.textContent = '–';
+
+	const cams = document.getElementById('netCams');
+	cams.replaceChildren(...n.cameras.map(c => {
+		const off = chosen && c.interface && c.interface !== chosen.name;
+		const s = el('span', off ? 'warn' : '', c.camera + ' → ' + (c.label ? c.label + ' (' + c.interface + ')' : 'no local route') + (off ? ' — not on the selected interface' : ''));
+		s.title = c.host + (c.localIp ? ' · this Mac: ' + c.localIp : '');
+		return s;
+	}));
+	if (!n.cameras.length) cams.textContent = 'no cameras yet';
+}
+document.getElementById('netSelect').addEventListener('change', async e => {
+	try { await api('/network', { interface: e.target.value }); } catch (err) { toast(err.message); }
+	e.target.blur();
+	loadNetwork();
+});
+document.getElementById('netRefresh').addEventListener('click', loadNetwork);
+
 buildGlobalRow();
 poll();
+loadNetwork();
+setInterval(loadNetwork, 10000);
 </script>
 </body>
 </html>

@@ -8,9 +8,12 @@ actually answer /control/api/v1 are reported.
 """
 
 import ipaddress
+import re
 import select
 import socket
 import struct
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -118,10 +121,65 @@ def local_ipv4_addresses():
 	return sorted(ip for ip in ips if not ip.startswith('127.'))
 
 
-def mdns_browse(service_types=SERVICE_TYPES, timeout=2.5):
+def list_interfaces():
+	"""Active IPv4 interfaces except loopback:
+	[{'name': 'en0', 'label': 'Wi-Fi', 'ip': '192.168.34.118', 'prefix': 23,
+	  'network': '192.168.34.0/23', 'vpn': False}]
+	macOS: read from ifconfig, named after System Settings' hardware ports."""
+	if sys.platform != 'darwin':
+		return [{'name': '', 'label': 'Network', 'ip': ip, 'prefix': 24,
+				 'network': str(ipaddress.ip_network(ip + '/24', strict=False)), 'vpn': False}
+				for ip in local_ipv4_addresses()]
+	try:
+		out = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=3).stdout
+	except (OSError, subprocess.SubprocessError):
+		return []
+	labels = {}
+	try:
+		ports = subprocess.run(['networksetup', '-listallhardwareports'], capture_output=True, text=True, timeout=3).stdout
+		for port, dev in re.findall(r'Hardware Port: (.+)\nDevice: (\S+)', ports):
+			labels[dev] = port
+	except (OSError, subprocess.SubprocessError):
+		pass
+	result, name = [], None
+	for line in out.splitlines():
+		m = re.match(r'^(\S+?):? flags=', line)
+		if m:
+			name = m.group(1)
+			continue
+		m = re.match(r'\s+inet (\d+\.\d+\.\d+\.\d+) (?:--> \S+ )?netmask (0x[0-9a-f]+)', line)
+		if not m or not name or name.startswith('lo'):
+			continue
+		ip, mask = m.group(1), int(m.group(2), 16)
+		prefix = bin(mask).count('1')
+		vpn = name.startswith(('utun', 'ppp', 'ipsec', 'tun', 'tap'))
+		result.append({
+			'name': name,
+			'label': labels.get(name) or ('VPN' if vpn else name),
+			'ip': ip,
+			'prefix': prefix,
+			'network': str(ipaddress.ip_network('{}/{}'.format(ip, prefix), strict=False)),
+			'vpn': vpn,
+		})
+	return result
+
+
+def interface_for(host, interfaces):
+	"""The interface whose network contains `host` (an IP or name), else None."""
+	try:
+		addr = ipaddress.ip_address(socket.gethostbyname(host))
+	except (OSError, ValueError):
+		return None
+	for iface in interfaces:
+		if addr in ipaddress.ip_network(iface['network']):
+			return iface
+	return None
+
+
+def mdns_browse(service_types=SERVICE_TYPES, timeout=2.5, ips=None):
 	"""Return [{'name', 'host', 'ip', 'port', 'service'}] for every instance."""
 	socks = []
-	for ip in local_ipv4_addresses() or ['0.0.0.0']:
+	for ip in ips or local_ipv4_addresses() or ['0.0.0.0']:
 		s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
 		try:
@@ -205,10 +263,11 @@ def value_key(name):
 	return name.lower().rstrip('.')
 
 
-def discover_bonjour(timeout=2.5, probe_timeout=1.5):
-	"""Browse Bonjour and keep only instances that answer the camera API."""
+def discover_bonjour(timeout=2.5, probe_timeout=1.5, ips=None):
+	"""Browse Bonjour (from `ips`, default: every local address) and keep only
+	instances that answer the camera API."""
 	found = {}
-	for inst in mdns_browse(timeout=timeout):
+	for inst in mdns_browse(timeout=timeout, ips=ips):
 		host = inst['ip'] or inst['host']
 		found.setdefault((host, inst['port']), inst)
 
@@ -235,11 +294,22 @@ def discover_bonjour(timeout=2.5, probe_timeout=1.5):
 		return [r for r in pool.map(check, found.items()) if r]
 
 
-def discover_subnet(ports=(api.APP_PORT, 80), connect_timeout=0.35, probe_timeout=1.5):
-	"""Probe every host of each local /24 for the camera REST API."""
+MAX_SCAN_PREFIX = 22   # scan at most 1022 hosts per network
+
+
+def discover_subnet(ports=(api.APP_PORT, 80), connect_timeout=0.35, probe_timeout=1.5, networks=None):
+	"""Probe every host of the given networks for the camera REST API.
+	`networks` are this machine's addresses with prefix ('192.168.34.118/23');
+	default: each local address as a /24. Larger networks are cut down to the
+	/22 around this machine's address."""
+	if networks is None:
+		networks = [ip + '/24' for ip in local_ipv4_addresses()]
 	hosts = set()
-	for ip in local_ipv4_addresses():
-		net = ipaddress.ip_network(ip + '/24', strict=False)
+	for network in networks:
+		iface = ipaddress.ip_interface(network)
+		net = iface.network
+		if net.prefixlen < MAX_SCAN_PREFIX:
+			net = ipaddress.ip_network('{}/{}'.format(iface.ip, MAX_SCAN_PREFIX), strict=False)
 		hosts.update(str(h) for h in net.hosts())
 
 	def port_open(target):

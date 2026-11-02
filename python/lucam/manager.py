@@ -268,7 +268,7 @@ class CameraWorker(threading.Thread):
 			self.manager.live.ensure_running()
 		except RuntimeError as e:
 			raise api.ApiError(0, str(e))
-		rtmp_url = 'rtmp://{}:{}/live'.format(livestream.local_ip_toward(c.host), livestream.RTMP_PORT)
+		rtmp_url = 'rtmp://{}:{}/live'.format(self.manager.live_address_for(c.host), livestream.RTMP_PORT)
 		platforms = c.get('/livestreams/platforms') or []
 		for legacy in livestream.LEGACY_PLATFORMS:
 			if legacy in platforms:
@@ -802,6 +802,8 @@ class CameraManager:
 		self.discovery = {'running': False, 'mode': None, 'results': [], 'error': None, 'finished': 0}
 		self._save_timer = None
 		self.live = livestream.LiveServer()
+		self.settings = {'interface': 'auto'}   # network interface for discovery / live view
+		self.http_port = None                   # set by server.py, for the panel address
 		self._load()
 
 	# --- persistence ------------------------------------------------------------
@@ -816,6 +818,7 @@ class CameraManager:
 			self._log('could not read {}: {}'.format(self.config_path, e))
 			return
 		self.global_values = cfg.get('global', {})
+		self.settings.update(cfg.get('settings', {}))
 		for cam in cfg.get('cameras', []):
 			try:
 				self._spawn(cam.get('id') or uuid.uuid4().hex[:8], cam['address'],
@@ -836,6 +839,7 @@ class CameraManager:
 							 **({'focusLocked': True} if w.focus_locked else {})}
 							for w in self.workers.values()],
 				'global': self.global_values,
+				'settings': self.settings,
 			}
 		tmp = self.config_path + '.tmp'
 		with open(tmp, 'w') as f:
@@ -992,10 +996,11 @@ class CameraManager:
 
 		def job():
 			try:
+				ifaces = self._discovery_interfaces()
 				if mode == 'scan':
-					results = discovery.discover_subnet()
+					results = discovery.discover_subnet(networks=['{}/{}'.format(i['ip'], i['prefix']) for i in ifaces])
 				else:
-					results = discovery.discover_bonjour()
+					results = discovery.discover_bonjour(ips=[i['ip'] for i in ifaces])
 				err = None
 			except Exception as e:
 				results, err = [], str(e)
@@ -1003,6 +1008,71 @@ class CameraManager:
 				self.discovery.update(running=False, results=results, error=err, finished=time.time())
 
 		threading.Thread(target=job, name='lucam-discovery', daemon=True).start()
+
+	# --- network interfaces ---------------------------------------------------------
+
+	def _selected_interface(self, interfaces=None):
+		"""The chosen interface dict, None for 'auto'. Raises ValueError if the
+		chosen interface isn't connected right now."""
+		name = self.settings.get('interface', 'auto')
+		if name == 'auto':
+			return None
+		for iface in interfaces if interfaces is not None else discovery.list_interfaces():
+			if iface['name'] == name:
+				return iface
+		raise ValueError('network interface {} is not connected'.format(name))
+
+	def _discovery_interfaces(self):
+		"""Interfaces to search for cameras: the selected one, or every non-VPN one."""
+		ifaces = discovery.list_interfaces()
+		selected = self._selected_interface(ifaces)
+		if selected:
+			return [selected]
+		return [i for i in ifaces if not i['vpn']] or ifaces
+
+	def live_address_for(self, camera_host):
+		"""This Mac's address a camera should stream to: the selected interface's
+		when the camera is on its network, else the one the OS routes through."""
+		try:
+			selected = self._selected_interface()
+		except ValueError:
+			selected = None
+		if selected and discovery.interface_for(camera_host, [selected]):
+			return selected['ip']
+		return livestream.local_ip_toward(camera_host)
+
+	def network_info(self):
+		ifaces = discovery.list_interfaces()
+		with self.lock:
+			cams = [(w.state['name'] or w.state['address'], w.client.host) for w in self.workers.values()]
+		via = []
+		for name, host in cams:
+			iface = discovery.interface_for(host, ifaces)
+			try:
+				local = livestream.local_ip_toward(host)
+			except OSError:
+				local = None
+			if iface is None:   # not on a local network: report the routed interface
+				iface = next((i for i in ifaces if i['ip'] == local), None)
+			via.append({'camera': name, 'host': host, 'interface': iface and iface['name'],
+						'label': iface and iface['label'], 'localIp': local})
+		selected = self.settings.get('interface', 'auto')
+		return {
+			'interfaces': ifaces,
+			'selected': selected,
+			'selectedConnected': selected == 'auto' or any(i['name'] == selected for i in ifaces),
+			'port': self.http_port,
+			'cameras': via,
+		}
+
+	def set_interface(self, name):
+		name = str(name or 'auto')
+		if name != 'auto' and not any(i['name'] == name for i in discovery.list_interfaces()):
+			raise ValueError('unknown network interface ' + name)
+		with self.lock:
+			self.settings['interface'] = name
+		self._save_later()
+		self._log('network interface set to ' + name)
 
 	# --- state ----------------------------------------------------------------------
 
@@ -1127,6 +1197,10 @@ class CameraManager:
 		parts = [x for x in path.split('/') if x]
 		if method == 'GET' and parts == ['state']:
 			return self.snapshot()
+		if parts == ['network']:
+			if method == 'POST' and 'interface' in p:
+				self.set_interface(p['interface'])
+			return self.network_info()
 		if method != 'POST':
 			raise KeyError('no route')
 		if parts == ['cameras', 'add']:

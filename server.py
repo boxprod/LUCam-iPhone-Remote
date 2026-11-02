@@ -41,6 +41,7 @@ def main():
 	args = ap.parse_args()
 
 	manager = CameraManager(config_path=args.config)
+	manager.http_port = args.port
 
 	class Handler(BaseHTTPRequestHandler):
 		def log_message(self, fmt, *a):
