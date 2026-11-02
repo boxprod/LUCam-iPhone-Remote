@@ -115,6 +115,25 @@ main { padding: 12px 16px 40px; }
 .toast.info { background: var(--panel-2); border-color: var(--line); color: var(--text); }
 
 .tools { display: flex; gap: 4px; }
+.chev { width: 18px; height: 18px; flex: none; padding: 0; border: none; background: none; color: var(--muted); cursor: pointer; font-size: 11px; transition: transform .15s; }
+.chev:hover { color: var(--text); }
+.chev.open { transform: rotate(90deg); color: var(--accent); }
+.expand { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 4px -10px -8px; padding: 10px 14px 10px 52px; border-top: 1px solid var(--line); background: var(--panel-2); border-radius: 0 0 var(--radius) var(--radius); }
+.expand[hidden] { display: none; }
+.expand .grp { display: flex; align-items: center; gap: 8px; }
+.expand .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.expand input[type=range] { width: 320px; accent-color: var(--accent); }
+.expand input[type=range]:disabled { opacity: .35; }
+.expand .val { min-width: 44px; text-align: right; }
+.expand .sep { width: 1px; height: 22px; background: var(--line); }
+.expand .note { color: var(--muted); font-size: 11px; }
+.switch { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 3px 10px 3px 4px; cursor: pointer; }
+.switch::before { content: ""; width: 28px; height: 16px; border-radius: 999px; background: #3a3f46 radial-gradient(circle at 8px 50%, #c9ced6 5px, transparent 5.5px); }
+.switch.on::before { background: var(--ok) radial-gradient(circle at 20px 50%, #fff 5px, transparent 5.5px); }
+.switch:disabled { opacity: .35; cursor: default; }
+.btn.lock.on { background: var(--accent); border-color: var(--accent); color: #111; font-weight: 600; }
+.expand select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 5px 6px; max-width: 220px; }
+.expand .row-break { flex-basis: 100%; height: 0; }
 .fmt { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; text-align: left; border: 1px solid var(--line); background: var(--bg); border-radius: var(--radius); padding: 3px 7px; cursor: pointer; }
 .fmt:hover { border-color: #3c424a; }
 .fmt:disabled { opacity: .35; cursor: default; }
@@ -141,6 +160,7 @@ main { padding: 12px 16px 40px; }
 	<span class="sub" id="summary">–</span>
 	<span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
 	<span class="spacer"></span>
+	<button class="btn" id="stopLive" title="Cut every live feed and restore each camera's real recording format (ProRes, 4K…)" disabled>■ Stop all lives</button>
 	<a class="btn" href="/live" target="lucam-multiview">Multiview</a>
 	<button class="btn rec big" id="recAll"><span class="led"></span>REC ALL</button>
 	<button class="btn stop big" id="stopAll">■ STOP ALL</button>
@@ -414,7 +434,10 @@ function buildRow(cam) {
 	r.name.spellcheck = false;
 	r.name.addEventListener('keydown', e => { if (e.key === 'Enter') r.name.blur(); if (e.key === 'Escape') { r.name.value = r.cam.name; r.name.blur(); } });
 	r.name.addEventListener('change', () => act('/cameras/' + cam.id + '/update', { name: r.name.value }));
-	top.append(r.dot, r.name);
+	r.chev = el('button', 'chev', '▶');
+	r.chev.title = 'More controls (focus)';
+	r.chev.addEventListener('click', () => setExpanded(cam.id, r.expand.hidden));
+	top.append(r.chev, r.dot, r.name);
 	r.meta = el('div', 'meta');
 	r.err = el('div', 'err');
 	name.append(top, r.meta, r.err);
@@ -479,7 +502,197 @@ function buildRow(cam) {
 	const tools = el('div', 'tools');
 	tools.append(r.refresh, more);
 	r.el.append(tc, r.rec, tools);
+	buildExpand(r, cam);
 	return r;
+}
+
+// ---------------------------------------------------------------- expanded row (focus)
+const EXPANDED_KEY = 'lucam-expanded';
+let expanded = new Set();
+try { expanded = new Set(JSON.parse(localStorage.getItem(EXPANDED_KEY) || '[]')); } catch (e) { /* storage unavailable */ }
+
+function setExpanded(id, open) {
+	if (open) expanded.add(id); else expanded.delete(id);
+	try { localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expanded])); } catch (e) { /* storage unavailable */ }
+	const r = rows.get(id);
+	if (r) {
+		r.expand.hidden = !open;
+		r.chev.classList.toggle('open', open);
+		if (open) loadPresets(r);
+	}
+}
+
+function buildExpand(r, cam) {
+	const x = el('div', 'expand');
+	x.hidden = !expanded.has(cam.id);
+	r.chev.classList.toggle('open', !x.hidden);
+	const send = (param, value) => act('/cameras/' + cam.id + '/set', { param, value });
+
+	// Focus position. The phone turns continuous AF off when focus is set.
+	const fg = el('div', 'grp');
+	r.focus = el('input');
+	r.focus.type = 'range'; r.focus.min = 0; r.focus.max = 1000; r.focus.step = 1;
+	r.focusVal = el('span', 'val mono');
+	let timer = null;
+	const sendFocus = () => { timer = null; send('focus', r.focus.value / 1000); };
+	r.focus.addEventListener('input', () => {
+		r.focusTouched = Date.now();
+		r.focusVal.textContent = Math.round(r.focus.value / 10) + '%';
+		if (!timer) timer = setTimeout(sendFocus, 120);
+	});
+	r.focus.addEventListener('change', () => { r.focusTouched = Date.now(); clearTimeout(timer); sendFocus(); });
+	fg.append(el('span', 'lbl', 'Focus'), r.focus, r.focusVal);
+
+	// Autofocus: continuous on/off, plus a one-shot focus.
+	const ag = el('div', 'grp');
+	r.af = el('button', 'switch', 'Autofocus');
+	r.af.title = 'Continuous autofocus on/off';
+	r.af.addEventListener('click', () => send('autofocus', r.cam.autofocus !== 'Continuous'));
+	r.once = el('button', 'btn', 'Focus once');
+	r.once.title = 'Autofocus once, then hold';
+	r.once.addEventListener('click', () => send('focusonce', true));
+	ag.append(r.af, r.once);
+
+	// Lock: held by the controller (the app has no lock): AF off, focus changes refused.
+	const lg = el('div', 'grp');
+	r.lock = el('button', 'btn lock');
+	r.lock.addEventListener('click', () => send('focuslock', !r.cam.focusLocked));
+	r.focusNote = el('span', 'note');
+	lg.append(r.lock, r.focusNote);
+
+	// Display LUT on/off, one switch per display that has one (screen, HDMI).
+	r.lutGroup = el('div', 'grp');
+	r.lutSwitches = {};
+	x.append(fg, el('span', 'sep'), ag, el('span', 'sep'), lg, el('span', 'row-break'), buildPresets(r, cam),
+		el('span', 'sep'), r.lutGroup);
+	r.expand = x;
+	r.el.append(x);
+	if (!x.hidden) loadPresets(r);
+}
+
+// Camera presets (.cset / .bmcpreset files), straight to and from the camera.
+function buildPresets(r, cam) {
+	const base = '/api/cameras/' + cam.id + '/presets';
+	const g = el('div', 'grp');
+	r.presetSel = el('select');
+	r.presetSel.title = 'Presets stored on the camera';
+	const btn = (label, title, fn) => { const b = el('button', 'btn', label); b.title = title; b.addEventListener('click', fn); return b; };
+	const selected = () => r.presetSel.value;
+	const post = async (action, name) => {
+		try { await api('/cameras/' + cam.id + '/presets/' + action, { name }); }
+		catch (e) { toast(e.message); }
+		loadPresets(r);
+	};
+	const download = btn('⬇ Download', 'Download the selected preset file', () => {
+		if (!selected()) return;
+		const a = el('a');
+		a.href = base + '/download?name=' + encodeURIComponent(selected());
+		a.download = '';
+		document.body.append(a); a.click(); a.remove();
+	});
+	const apply = btn('Apply', 'Make the selected preset active on the camera', () => selected() && post('apply', selected()));
+	const del = btn('Delete', 'Delete the selected preset from the camera', () => {
+		if (selected() && confirm('Delete preset "' + selected() + '" from ' + (r.cam.name || r.cam.address) + '?')) post('delete', selected());
+	});
+	const save = btn('Save current…', "Save the camera's current settings as a new preset", () => {
+		const d = new Date(), pad = n => String(n).padStart(2, '0');
+		const name = prompt('Preset name', (r.cam.name || 'Camera') + ' ' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + pad(d.getMinutes()));
+		if (name && name.trim()) post('save', name.trim());
+	});
+	const file = el('input');
+	file.type = 'file'; file.accept = '.cset,.bmcpreset'; file.hidden = true;
+	file.addEventListener('change', async () => {
+		const f = file.files[0];
+		file.value = '';
+		if (!f) return;
+		try {
+			const res = await fetch(base + '/upload?filename=' + encodeURIComponent(f.name), { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: f });
+			const data = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(data.error || res.statusText);
+			toast('Uploaded to ' + (r.cam.name || r.cam.address) + ' as "' + data.presetAdded + '"', 'info');
+		} catch (e) { toast('Upload failed: ' + e.message); }
+		loadPresets(r);
+	});
+	const upload = btn('⬆ Upload…', 'Upload a preset file (.cset or .bmcpreset) to the camera', () => file.click());
+	r.presetButtons = [download, apply, del];
+	r.presetAll = [r.presetSel, download, apply, del, save, upload];
+	g.append(el('span', 'lbl', 'Presets'), r.presetSel, download, apply, del, save, upload, file);
+	return g;
+}
+
+const LUT_LABELS = { Device: 'Screen', HDMI: 'HDMI' };
+function renderLuts(r, cam) {
+	const luts = cam.displayLuts || {};
+	const names = Object.keys(luts);
+	r.lutGroup.hidden = !names.length;
+	if (!r.lutGroup.firstChild && names.length) r.lutGroup.append(el('span', 'lbl', 'LUT'));
+	for (const name of names) {
+		let sw = r.lutSwitches[name];
+		if (!sw) {
+			sw = el('button', 'switch');
+			sw.title = 'Display LUT on the ' + (LUT_LABELS[name] || name) + ' output (preview only, not recorded)';
+			sw.addEventListener('click', () => act('/cameras/' + cam.id + '/set',
+				{ param: 'displaylut', value: { display: name, enabled: !r.cam.displayLuts[name] } }));
+			r.lutSwitches[name] = sw;
+			r.lutGroup.append(sw);
+		}
+		sw.classList.toggle('on', !!luts[name]);
+		sw.textContent = (LUT_LABELS[name] || name) + (luts[name] ? ' on' : ' off');
+		sw.disabled = !cam.online;
+	}
+}
+
+async function loadPresets(r) {
+	if (!r.cam || !r.cam.online) return;
+	let data;
+	try { data = await api('/cameras/' + r.cam.id + '/presets'); }
+	catch (e) {
+		r.presetSel.replaceChildren(el('option', '', 'presets unavailable'));
+		r.presetCount = 0;   // don't retry on every refresh; reopening the row reloads
+		for (const b of r.presetButtons) b.disabled = true;
+		return;
+	}
+	const keep = r.presetSel.value;
+	const opts = data.presets.map(name => {
+		const o = el('option', '', name + (name === data.active ? '  (active)' : ''));
+		o.value = name;
+		return o;
+	});
+	r.presetSel.replaceChildren(...(opts.length ? opts : [el('option', '', 'no presets on camera')]));
+	if (opts.length) r.presetSel.value = data.presets.includes(keep) ? keep : (data.active && data.presets.includes(data.active) ? data.active : data.presets[0]);
+	r.presetCount = opts.length;
+	for (const b of r.presetButtons) b.disabled = !opts.length;
+}
+
+function renderExpand(r, cam) {
+	const usable = cam.online && cam.focusControllable;
+	const locked = !!cam.focusLocked;
+	r.focus.disabled = !usable || locked;
+	// don't fight the slider while it's being dragged (or just after)
+	if (cam.focus != null && !(r.focusTouched && Date.now() - r.focusTouched < 1500)) {
+		r.focus.value = Math.round(cam.focus * 1000);
+		r.focusVal.textContent = Math.round(cam.focus * 100) + '%';
+	} else if (cam.focus == null && !r.focusTouched) {
+		r.focusVal.textContent = '–';
+	}
+	const afOn = cam.autofocus === 'Continuous';
+	r.af.classList.toggle('on', afOn);
+	r.af.textContent = afOn ? 'Autofocus on' : 'Autofocus off';
+	r.af.disabled = !cam.online || !cam.autofocusSupported || locked;
+	r.once.disabled = !usable || locked;
+	r.lock.classList.toggle('on', locked);
+	r.lock.textContent = locked ? '🔒 Focus locked' : '🔓 Lock focus';
+	r.lock.disabled = !usable;
+	r.lock.title = locked ? 'Unlock focus' : 'Turn autofocus off and block focus changes until unlocked';
+	r.focusNote.textContent = !cam.online ? 'offline' : !cam.focusControllable ? 'focus not controllable on this camera'
+		: locked ? 'held at ' + Math.round((cam.focus || 0) * 100) + '%' : afOn ? 'moving the slider turns autofocus off' : '';
+	r.chev.title = 'More controls (focus' + (locked ? ', locked' : afOn ? ', AF on' : '') + ', presets, LUT)';
+	renderLuts(r, cam);
+	for (const b of r.presetAll) b.disabled = !cam.online || (r.presetButtons.includes(b) && !r.presetCount);
+	if (cam.online && r.presetCount === undefined && !r.expand.hidden && !r.presetLoading) {
+		r.presetLoading = true;
+		loadPresets(r).finally(() => { r.presetLoading = false; });
+	}
 }
 
 function codecName(cam, value) {
@@ -578,6 +791,7 @@ function renderRow(r, cam) {
 		? 'Real recording format: ' + fmtLabel + '\nNow recording ' + (cam.deviceFormat || '') + ' for the live view. The real format comes back when the live view stops or REC starts.'
 		: 'Recording format: ' + fmtLabel;
 	r.fmt.disabled = !cam.online || !(cam.resolutionOptions || []).length;
+	renderExpand(r, cam);
 	r.tc.textContent = cam.timecode || (cam.online ? '' : 'offline');
 	r.clip.textContent = (cam.liveOurs ? '◉ LIVE · ' : '') + (cam.clipName ? 'next ' + cam.clipName : '');
 	r.rec.className = 'btn rec' + (cam.recording ? ' on' : '') + (cam.recordPending ? ' pending' : '');
@@ -642,6 +856,10 @@ function renderHeader(ok) {
 		cams.length + ' camera' + (cams.length === 1 ? '' : 's') + ' · ' + online + ' online' + (recording ? ' · ' + recording + ' recording' : '');
 	document.getElementById('connDot').className = 'dot ' + (ok ? 'ok' : 'bad');
 	document.getElementById('connText').textContent = ok ? 'controller connected' : 'controller unreachable';
+	const live = cams.filter(c => c.liveMode || c.liveOurs).length;
+	const stopLive = document.getElementById('stopLive');
+	stopLive.disabled = !live;
+	stopLive.textContent = '■ Stop all lives' + (live ? ' (' + live + ')' : '');
 	const recAll = document.getElementById('recAll');
 	recAll.classList.toggle('on', state.anyRecording);
 	recAll.disabled = !cams.some(c => c.active && c.online);
@@ -663,6 +881,7 @@ async function poll() {
 	setTimeout(poll, 350);
 }
 
+document.getElementById('stopLive').addEventListener('click', () => act('/global/stoplive'));
 document.getElementById('recAll').addEventListener('click', () => act('/global/record', { recording: true }));
 document.getElementById('stopAll').addEventListener('click', () => act('/global/record', { recording: false }));
 document.getElementById('addBtn').addEventListener('click', addCam);

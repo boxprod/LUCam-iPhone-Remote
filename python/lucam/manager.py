@@ -16,7 +16,9 @@ import uuid
 
 from . import api, discovery, livestream
 
-PARAMS = ('lens', 'iso', 'fps', 'shutter', 'wb', 'tint', 'letter', 'reel', 'codec', 'resolution', 'colorspace')
+PARAMS = ('lens', 'iso', 'fps', 'shutter', 'wb', 'tint', 'letter', 'reel', 'codec', 'resolution', 'colorspace',
+		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut')
+FOCUS_PARAMS = ('focus', 'autofocus', 'focusonce')   # refused while a camera's focus is locked
 
 # Recording format used while a camera is in live view: the app only streams
 # when it records H.264, and only at whole-number frame rates.
@@ -106,16 +108,22 @@ class CameraWorker(threading.Thread):
 	POLL_FULL = 3.0      # all settings
 	RETRY_OFFLINE = 2.0
 
-	def __init__(self, manager, cam_id, address, name='', active=True, live_mode=False, saved_format=None):
+	def __init__(self, manager, cam_id, address, name='', active=True, live_mode=False, saved_format=None,
+				 focus_locked=False):
 		super().__init__(name='lucam-' + cam_id, daemon=True)
 		self.manager = manager
 		# Live mode: the camera temporarily records H.264 1080p so it can stream;
 		# `saved_format` is its real recording format, restored on exit and before REC.
 		self.live_mode = bool(live_mode and saved_format)
+		# Focus lock is ours (the app has no lock setting): AF off, and focus
+		# commands refused until unlocked. Saved in cameras.json.
+		self.focus_locked = bool(focus_locked)
+		self._focus_target = None   # latest slider value; older ones are dropped
 		self.saved_format = saved_format if self.live_mode else None
 		self._format_lock = threading.Lock()
 		self._supported = []
 		self._lenses = []
+		self._lut_displays = []
 		self._device_format = None
 		self._device_dr = None
 		# Until one answers, cycle through the variants of what the user typed
@@ -151,6 +159,9 @@ class CameraWorker(threading.Thread):
 			'streaming': None, 'streamBitrate': 0, 'liveOurs': False, 'livePath': None, 'liveWarning': None,
 			'lens': None, 'lensOptions': [], 'lensRange': None, 'lensNative': False, 'lensMain': None,
 			'lensId': None,
+			'focus': None, 'focusControllable': False, 'autofocus': None, 'autofocusSupported': False,
+			'focusLocked': bool(focus_locked),
+			'displayLuts': {},   # {'Device': False, 'HDMI': True}: display LUT on/off per display
 			'iso': None, 'isoOptions': [],
 			'fps': None, 'fpsOptions': [],
 			'codec': None, 'codecOptions': [], 'resolution': None, 'resolutionOptions': [],
@@ -232,6 +243,9 @@ class CameraWorker(threading.Thread):
 			tc = self._try('timecode', c.timecode)
 			if tc is not None:
 				upd['timecode'] = tc
+			fo = self._try('focus', c.focus)
+			if fo is not None:
+				upd['focus'] = fo
 			self._update(**upd)
 			if now >= self._next_full:
 				self._poll_settings()
@@ -341,6 +355,18 @@ class CameraWorker(threading.Thread):
 										 f['recordResolution']['width'], f['recordResolution']['height']).strip(' ·'),
 		} for f in self._supported if f.get('recordResolution')]
 		upd['colorspaceOptions'] = self._try('colorspace', c.supported_dynamic_ranges) or []
+		# Displays with a LUT switch: the listed ones plus HDMI (not listed).
+		names = list(dict.fromkeys((self._try('displaylut', c.displays) or []) + ['HDMI']))
+		self._lut_displays = []
+		for name in names:
+			try:
+				c.display_lut(name)
+				self._lut_displays.append(name)
+			except api.ApiError as e:
+				if e.status == 0:
+					raise
+		fd = self._try('focus', c.get, '/lens/focus/description') or {}
+		upd['focusControllable'] = bool(fd.get('controllable'))
 		lenses = self._try('lenscams', c.lens_cameras)
 		self._lenses = [l for l in (lenses or []) if l.get('isAvailable', True) and l.get('id')]
 		zd = self._try('lens', c.zoom_description) or {}
@@ -405,6 +431,18 @@ class CameraWorker(threading.Thread):
 			if dr is not None:
 				self._device_dr = dr
 			upd.update(self._format_state())
+		luts = {}
+		for name in self._lut_displays:
+			try:
+				luts[name] = c.display_lut(name)
+			except api.ApiError as e:
+				if e.status == 0:
+					raise
+		upd['displayLuts'] = luts
+		af = self._try('autofocus', c.autofocus)
+		if af:
+			upd['autofocusSupported'] = bool(af.get('supported', True))
+			upd['autofocus'] = 'Continuous' if af.get('enabled') and af.get('mode') == 'Continuous' else 'Off'
 		z = self._try('lens', c.zoom)
 		if z:
 			upd['lens'] = z.get('focalLength')
@@ -601,6 +639,13 @@ class CameraWorker(threading.Thread):
 	# --- commands ---------------------------------------------------------------
 
 	def queue_set(self, param, value):
+		if param == 'focus':
+			# Slider drags send many values: keep only the latest.
+			with self.manager.lock:
+				queued = self._focus_target is not None
+				self._focus_target = value
+			if queued:
+				return
 		self.commands.put(('set', param, value))
 
 	def queue(self, *cmd):
@@ -643,7 +688,42 @@ class CameraWorker(threading.Thread):
 
 	def _set(self, param, value):
 		c = self.client
-		if param == 'iso':
+		if param in FOCUS_PARAMS and self.focus_locked:
+			if param == 'focus':
+				with self.manager.lock:
+					self._focus_target = None
+			raise api.ApiError(0, 'focus is locked')
+		if param == 'focus':
+			with self.manager.lock:
+				value, self._focus_target = self._focus_target, None
+			if value is None:
+				return
+			c.set_focus(value)
+			self._update(focus=max(0.0, min(1.0, float(value))), autofocus='Off')
+		elif param == 'autofocus':
+			on = str(value).lower() in ('1', 'true', 'on', 'continuous')
+			c.set_autofocus(on)
+			self._update(autofocus='Continuous' if on else 'Off')
+		elif param == 'focusonce':
+			c.focus_once()
+		elif param == 'displaylut':
+			# value: {'display': 'HDMI', 'enabled': True}
+			if not isinstance(value, dict) or 'display' not in value or 'enabled' not in value:
+				raise ValueError('expected {"display": ..., "enabled": ...}')
+			display, enabled = str(value['display']), bool(value['enabled'])
+			if display not in self._lut_displays:
+				raise ValueError('no LUT switch for display ' + display)
+			c.set_display_lut(display, enabled)
+			self._update(displayLuts=dict(self.state.get('displayLuts') or {}, **{display: enabled}))
+		elif param == 'focuslock':
+			lock = str(value).lower() in ('1', 'true', 'on', 'lock', 'locked')
+			if lock and self.state.get('autofocus') != 'Off':
+				c.set_autofocus(False)   # hold focus where it is
+				self._update(autofocus='Off')
+			self.focus_locked = lock
+			self._update(focusLocked=lock)
+			self.manager._save_later()
+		elif param == 'iso':
 			c.set_iso(int(float(value)))
 			self._update(iso=int(float(value)))
 		elif param == 'shutter':
@@ -740,7 +820,7 @@ class CameraManager:
 			try:
 				self._spawn(cam.get('id') or uuid.uuid4().hex[:8], cam['address'],
 							cam.get('name', ''), cam.get('active', True),
-							cam.get('liveMode', False), cam.get('savedFormat'))
+							cam.get('liveMode', False), cam.get('savedFormat'), cam.get('focusLocked', False))
 			except (KeyError, ValueError) as e:
 				self._log('skipping saved camera: {}'.format(e))
 
@@ -752,7 +832,8 @@ class CameraManager:
 				'cameras': [{'id': w.state['id'],
 							 'address': w.state['address'] if w.resolved else w.typed_address,
 							 'name': w.state['name'], 'active': w.state['active'],
-							 **({'liveMode': True, 'savedFormat': w.saved_format} if w.live_mode else {})}
+							 **({'liveMode': True, 'savedFormat': w.saved_format} if w.live_mode else {}),
+							 **({'focusLocked': True} if w.focus_locked else {})}
 							for w in self.workers.values()],
 				'global': self.global_values,
 			}
@@ -777,8 +858,8 @@ class CameraManager:
 
 	# --- cameras ------------------------------------------------------------------
 
-	def _spawn(self, cam_id, address, name, active, live_mode=False, saved_format=None):
-		w = CameraWorker(self, cam_id, address, name, active, live_mode, saved_format)
+	def _spawn(self, cam_id, address, name, active, live_mode=False, saved_format=None, focus_locked=False):
+		w = CameraWorker(self, cam_id, address, name, active, live_mode, saved_format, focus_locked)
 		with self.lock:
 			self.workers[cam_id] = w
 		w.start()
@@ -845,6 +926,15 @@ class CameraManager:
 	def stream(self, cam_ids, enabled):
 		for cam_id in cam_ids:
 			self._worker(cam_id).queue('stream', bool(enabled))
+
+	def stop_all_live(self):
+		"""End every live view (armed or not): stop the stream and restore each
+		camera's real recording format. Returns the number of cameras affected."""
+		with self.lock:
+			live = [w for w in self.workers.values() if w.live_mode or w.state.get('liveOurs')]
+		for w in live:
+			w.queue('stream', False)
+		return len(live)
 
 	def refresh(self, cam_id):
 		self._worker(cam_id).queue('refresh')
@@ -959,8 +1049,16 @@ class CameraManager:
 	# --- HTTP API -------------------------------------------------------------------
 
 	def handle_http(self, method, path, body=b''):
-		"""Request handler used by server.py. Returns (status, content_type, bytes)."""
-		path = path.split('?', 1)[0]
+		"""Request handler used by server.py.
+		Returns (status, content_type, bytes, extra_headers)."""
+		status, ctype, data, *extra = self._handle_http(method, path, body)
+		return status, ctype, data, (extra[0] if extra else {})
+
+	def _handle_http(self, method, path, body):
+		path, _, query = path.partition('?')
+		m = re.match(r'^/api/cameras/([^/]+)/presets(?:/([a-z]+))?$', path)
+		if m:
+			return self._presets(method, m.group(1), m.group(2), dict(urllib.parse.parse_qsl(query)), body)
 		if method == 'GET' and path in ('/', '/index.html'):
 			return self._static('index.html')
 		if method == 'GET' and (path == '/live' or path.startswith('/live/')):
@@ -978,6 +1076,45 @@ class CameraManager:
 			return 404, 'application/json', json.dumps({'error': str(e).strip("'")}).encode()
 		except (ValueError, TypeError) as e:
 			return 400, 'application/json', json.dumps({'error': str(e)}).encode()
+
+	PRESET_EXTENSIONS = ('.cset', '.bmcpreset')
+
+	def _presets(self, method, cam_id, action, query, body):
+		"""Preset files go straight to/from the camera (binary, so outside _route)."""
+		def as_json(status, obj):
+			return status, 'application/json', json.dumps(obj).encode()
+		try:
+			client = self._worker(cam_id).client
+			if method == 'GET' and action is None:
+				return as_json(200, {'presets': client.presets(), 'active': client.active_preset()})
+			if method == 'GET' and action == 'download':
+				data, filename = client.download_preset(query['name'])
+				quoted = urllib.parse.quote(filename)
+				return 200, 'application/octet-stream', data, {
+					'Content-Disposition': "attachment; filename=\"{}\"; filename*=UTF-8''{}".format(
+						filename.encode('ascii', 'replace').decode().replace('"', "'"), quoted)}
+			if method == 'POST' and action == 'upload':
+				filename = os.path.basename(query.get('filename', '')).strip()
+				if not filename.lower().endswith(self.PRESET_EXTENSIONS):
+					raise ValueError('preset files end in .cset or .bmcpreset')
+				if not body or len(body) > 2 * 1024 * 1024:
+					raise ValueError('empty or oversized preset file')
+				return as_json(200, {'presetAdded': client.upload_preset(filename, body)})
+			if method == 'POST' and action in ('save', 'apply', 'delete'):
+				name = str(json.loads(body.decode('utf-8') or '{}').get('name', '')).strip()
+				if not name or re.search(r'[\x00-\x1f"/:*?<>|\\]', name):
+					raise ValueError('invalid preset name')
+				getattr(client, action + '_preset')(name)
+				return as_json(200, {'ok': True})
+			return as_json(404, {'error': 'no route'})
+		except KeyError as e:
+			return as_json(404 if 'camera' in str(e) else 400, {'error': 'missing ' + str(e).strip("'")})
+		except (ValueError, TypeError) as e:
+			return as_json(400, {'error': str(e)})
+		except api.ApiError as e:
+			if e.status == 404 and action in ('download', 'apply', 'delete'):
+				return as_json(404, {'error': 'preset not found on the camera'})
+			return as_json(502, {'error': 'camera: {}'.format(e)})
 
 	def _static(self, name):
 		try:
@@ -1009,6 +1146,8 @@ class CameraManager:
 		if parts == ['global', 'stream']:
 			self.stream(self.active_ids(), p['enabled'])
 			return None
+		if parts == ['global', 'stoplive']:
+			return {'stopped': self.stop_all_live()}
 		if parts == ['global', 'active']:
 			for cam_id in list(self.workers):
 				self.update_camera(cam_id, active=bool(p['active']))

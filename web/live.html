@@ -70,6 +70,7 @@ main.single .tile { height: 100%; }
 	<span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
 	<span class="spacer"></span>
 	<button class="btn" id="startAll" hidden>Start all armed</button>
+	<button class="btn" id="stopLive" title="Cut every live feed and restore each camera's real recording format (ProRes, 4K…)" disabled>■ Stop all lives</button>
 	<a class="btn" href="/live" id="multiLink">Multiview</a>
 	<a class="btn" href="/">Control panel</a>
 	<button class="btn rec big" id="recAll" title="Start recording on all armed cameras. Live views stop first: each camera goes back to its real recording format."><span class="led"></span>REC ALL</button>
@@ -209,12 +210,17 @@ function renderHeader(ok) {
 		(recording ? ' · ' + recording + ' recording' : '') + ' · ' + live + ' live';
 	document.getElementById('connDot').className = 'dot ' + (ok ? 'ok' : 'bad');
 	document.getElementById('connText').textContent = ok ? 'controller connected' : 'controller unreachable';
+	const liveNow = cams.filter(c => c.liveMode || c.liveOurs).length;
+	const stopLive = document.getElementById('stopLive');
+	stopLive.disabled = !liveNow;
+	stopLive.textContent = '■ Stop all lives' + (liveNow ? ' (' + liveNow + ')' : '');
 	const recAll = document.getElementById('recAll');
 	recAll.classList.toggle('on', !!state.anyRecording);
 	recAll.disabled = !cams.some(c => c.active && c.online);
 }
 
 document.getElementById('startAll').addEventListener('click', () => act('/global/stream', { enabled: true }));
+document.getElementById('stopLive').addEventListener('click', () => act('/global/stoplive'));
 document.getElementById('recAll').addEventListener('click', () => act('/global/record', { recording: true }));
 document.getElementById('stopAll').addEventListener('click', () => act('/global/record', { recording: false }));
 

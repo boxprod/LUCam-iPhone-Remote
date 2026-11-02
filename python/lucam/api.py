@@ -71,12 +71,17 @@ class CameraClient:
 		h = '[{}]'.format(self.host) if ':' in self.host else self.host
 		return '{}://{}:{}{}'.format(self.scheme, h, self.port, API_ROOT)
 
-	def request(self, method, path, body=None, timeout=None, raw=None, content_type=None):
+	def request(self, method, path, body=None, timeout=None, raw=None, content_type=None,
+				extra_headers=None, headers_out=None, binary=False):
+		"""JSON in/out by default. `raw` sends bytes; `binary=True` returns the
+		response bytes; `headers_out` (a dict) receives the response headers."""
 		data = None
 		headers = {'Accept': 'application/json'}
 		if raw is not None:
 			data = raw if isinstance(raw, bytes) else raw.encode('utf-8')
 			headers['Content-Type'] = content_type or 'application/octet-stream'
+		if extra_headers:
+			headers.update(extra_headers)
 		elif body is not None:
 			data = json.dumps(body).encode('utf-8')
 			headers['Content-Type'] = 'application/json'
@@ -85,6 +90,8 @@ class CameraClient:
 		try:
 			with urllib.request.urlopen(req, timeout=timeout or self.timeout, context=ctx) as resp:
 				raw = resp.read()
+				if headers_out is not None:
+					headers_out.update(resp.headers.items())
 		except urllib.error.HTTPError as e:
 			detail = ''
 			try:
@@ -94,6 +101,8 @@ class CameraClient:
 			raise ApiError(e.code, detail or e.reason)
 		except (urllib.error.URLError, OSError) as e:
 			raise ApiError(0, str(getattr(e, 'reason', e)))
+		if binary:
+			return raw
 		if not raw:
 			return None
 		try:
@@ -223,6 +232,76 @@ class CameraClient:
 
 	def set_focal_length(self, mm):
 		self.put('/lens/zoom', {'focalLength': int(mm)})
+
+	def focus(self):
+		"""Focus position, normalised 0..1 (the phone's own lens position scale)."""
+		return (self.get('/lens/focus') or {}).get('normalised')
+
+	def set_focus(self, normalised):
+		# On the iPhone app this also turns continuous autofocus off.
+		self.put('/lens/focus', {'normalised': max(0.0, min(1.0, float(normalised)))})
+
+	def autofocus(self):
+		"""iPhone app (undocumented): {'supported', 'enabled', 'mode': 'Continuous'|'OneShot', 'state'}"""
+		return self.get('/lens/focus/autoFocus') or {}
+
+	def set_autofocus(self, continuous):
+		self.put('/lens/focus/autoFocus', {'enabled': True, 'mode': 'Continuous'} if continuous else {'mode': 'OneShot'})
+
+	def focus_once(self):
+		self.put('/lens/focus/doAutoFocus')
+
+	# --- monitoring ----------------------------------------------------------
+
+	def displays(self):
+		"""Display names, e.g. ['Device'] (the phone's screen). HDMI isn't listed
+		but has its own settings, so callers should also try 'HDMI'."""
+		return (self.get('/monitoring/display') or {}).get('displays', [])
+
+	def display_lut(self, display):
+		return bool((self.get('/monitoring/{}/displayLUT'.format(urllib.parse.quote(display))) or {}).get('enabled'))
+
+	def set_display_lut(self, display, enabled):
+		self.put('/monitoring/{}/displayLUT'.format(urllib.parse.quote(display)), {'enabled': bool(enabled)})
+
+	# --- presets (iPhone app: .cset / .bmcpreset JSON files) ------------------
+	# The list gives names without extension; downloads, apply and delete use
+	# that name as is.
+
+	def presets(self):
+		return (self.get('/presets') or {}).get('presets', [])
+
+	def active_preset(self):
+		return (self.get('/presets/active') or {}).get('preset') or ''
+
+	def download_preset(self, name):
+		"""Returns (bytes, filename)."""
+		headers = {}
+		data = self.request('GET', '/presets/' + urllib.parse.quote(name), binary=True, headers_out=headers, timeout=10)
+		disposition = {k.lower(): v for k, v in headers.items()}.get('content-disposition', '')
+		filename = disposition.split('filename=', 1)[1].strip('"; ') if 'filename=' in disposition else name + '.cset'
+		try:   # the phone sends UTF-8; Python reads response headers as Latin-1
+			filename = filename.encode('latin-1').decode('utf-8')
+		except (UnicodeEncodeError, UnicodeDecodeError):
+			pass
+		return data, filename
+
+	def upload_preset(self, filename, data):
+		"""Returns the preset name the camera gave it (it adds -1, -2... on clashes)."""
+		disposition = 'attachment; filename="{}"'.format(filename.replace('"', "'"))
+		result = self.request('POST', '/presets', raw=data, timeout=10,
+							  extra_headers={'Content-Disposition': disposition})
+		return (result or {}).get('presetAdded')
+
+	def save_preset(self, name):
+		"""Save the camera's current settings as a preset."""
+		self.put('/presets/' + urllib.parse.quote(name + '.bmcpreset'))
+
+	def apply_preset(self, name):
+		self.put('/presets/active', {'preset': name})
+
+	def delete_preset(self, name):
+		self.request('DELETE', '/presets/' + urllib.parse.quote(name))
 
 	def lens_cameras(self):
 		"""Physical lenses (iPhone app): [{'id': 'Lens24mm', 'focalLength': 24,

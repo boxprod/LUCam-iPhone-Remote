@@ -49,9 +49,11 @@ def main():
 		def _handle(self, method):
 			n = int(self.headers.get('Content-Length') or 0)
 			body = self.rfile.read(n) if n else b''
-			status, ctype, data = manager.handle_http(method, self.path, body)
+			status, ctype, data, extra = manager.handle_http(method, self.path, body)
 			self.send_response(status)
 			self.send_header('Content-Type', ctype)
+			for k, v in extra.items():
+				self.send_header(k, v)
 			self.send_header('Content-Length', str(len(data)))
 			self.send_header('Cache-Control', 'no-store')
 			self.end_headers()

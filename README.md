@@ -87,6 +87,22 @@ view and restores any camera that is in live mode.
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.
 - Each value field takes typing + Enter, ↑/↓ to step (Shift ×10), or the ▾ list of values the camera reports as supported.
 - An amber value is still being sent. If the camera rejects it, the field reverts and the error shows under the camera name.
+- **▶** before a camera's name expands its row with focus controls (the
+  browser remembers which rows are open):
+  - **Focus** slider, 0–100 % on the phone's own scale. Moving it turns
+    continuous autofocus off; the phone does this itself.
+  - **Autofocus** switch (continuous on/off) and **Focus once**.
+  - **Lock focus**: turns autofocus off and refuses every focus change for
+    that camera until unlocked. The app has no lock of its own, so the
+    controller holds it, saved in `cameras.json`.
+  - **Presets**: the camera's presets (active one marked), with **⬇ Download**
+    (saves the `.cset` file), **Apply**, **Delete**, **Save current…** (saves
+    the camera's current settings as a new preset) and **⬆ Upload…**
+    (`.cset` or `.bmcpreset`; the camera adds -1, -2… if the name is taken).
+    Presets also store focus, LUT selection and many other app settings, so
+    applying one can change more than exposure and colour.
+  - **LUT**: display LUT on/off for each output that has one: **Screen** (the
+    phone's display) and **HDMI**. It only affects monitoring.
 - **↻** reconnects a camera from scratch.
 - Cameras are listed by camera letter (A, B, C…), here and in Multiview. Cameras whose letter isn't known yet (connecting, offline) come last.
 - **⋯** menu: auto white balance, open/stop live view, reconnect, remove.
@@ -136,7 +152,9 @@ saves the camera's real recording format and switches it to H.264 1080p. The
 frame rate is kept, rounded to a whole number (23.98 → 24). The real format is
 restored when:
 
-- the live view is stopped (⋯ → Stop live view, or Stop live in the viewer);
+- the live view is stopped (⋯ → Stop live view, Stop live in the viewer, or
+  **■ Stop all lives** in the control panel or Multiview header, which ends
+  every live view at once, armed or not);
 - REC is pressed on **any** camera, or REC ALL. Every camera in live view is
   restored first, and only then do the armed cameras start recording. A camera
   whose format can't be restored is not recorded, and shows an error instead;
@@ -191,5 +209,18 @@ Tested on an iPhone 15 Pro with app 3.5.3:
   so one value works across different iPhone models. For cameras without a
   lens list, Lens falls back to `/lens/zoom` and the per-model table
   `NATIVE_LENSES_MM` in `python/lucam/manager.py`.
+- **Focus.** `/lens/focus` (normalised 0–1) and `PUT /lens/focus/doAutoFocus`
+  are documented. Continuous autofocus is the undocumented
+  `/lens/focus/autoFocus`: `{"enabled": true, "mode": "Continuous"}` for on,
+  `{"mode": "OneShot"}` for off. Other modes are rejected.
+- **Presets.** `/presets` lists names without extension; download, apply and
+  delete use that name; uploads need a `Content-Disposition` filename ending in
+  `.cset` or `.bmcpreset`. A preset is a JSON file of the app's settings. The
+  phone serves its own API reference at
+  `https://<phone>:4444/control/documentation.html`.
+- **LUTs can't be transferred.** The app's API has no LUT file endpoints, only
+  a display-LUT on/off switch per display (`/monitoring/{display}/displayLUT`;
+  the phone lists `Device` in `/monitoring/display`, and `HDMI` works too). Presets name the
+  selected LUT (`lutSelection`) but don't contain the LUT file.
 - **Unsupported controls.** Any endpoint the app doesn't implement greys out
   that control on the row instead of failing.
