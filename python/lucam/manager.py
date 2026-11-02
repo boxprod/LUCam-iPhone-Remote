@@ -266,7 +266,17 @@ class CameraWorker(threading.Thread):
 		configs = sum(len(p.get('configs', [])) for p in current.get('profiles', []))
 		urls = [s.get('url') for s in current.get('servers', [])]
 		if rtmp_url not in urls or configs != len(livestream.STREAM_RATES) * len(livestream.STREAM_BITRATES):
+			if current:
+				# The phone won't overwrite an existing platform ("Platforms import
+				# failed"), so a changed Mac address needs delete-then-upload.
+				if (c.stream_status() or {}).get('status') not in (None, 'Idle'):
+					c.stream(False)
+				c.request('DELETE', '/livestreams/customPlatforms/' + urllib.parse.quote(livestream.PLATFORM_ID))
 			c.upload_platform(livestream.PLATFORM_FILE, livestream.platform_xml(rtmp_url))
+			urls = [s.get('url') for s in c.platform(livestream.PLATFORM_ID).get('servers', [])]
+			if rtmp_url not in urls:
+				raise api.ApiError(0, 'the camera did not accept the live platform for {}'.format(rtmp_url))
+			self.manager._log('{}: live platform set to {}'.format(self.state['name'] or self.state['address'], rtmp_url))
 		status = (c.stream_status() or {}).get('status')
 		key = self.state['id']
 		plat = c.active_platform()
