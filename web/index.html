@@ -393,9 +393,14 @@ function buildGlobalRow() {
 	row.append(armAll, lab, el('div'));
 	for (const p of GLOBAL_PARAMS) {
 		if (p === 'lens') row.append(el('div'));   // no global format: per camera only
-		const c = combo(p, v => {
-			act('/global/set', { param: p, value: v });
+		const c = combo(p, async v => {
 			for (const cam of state.cameras) if (cam.active) markPending(cam.id, p, v);
+			// the controller snaps out-of-range values per camera: show what each got
+			const res = await act('/global/set', { param: p, value: v });
+			for (const [id, sent] of Object.entries((res && res.values) || {})) {
+				const cam = state.cameras.find(c => c.id === id);
+				if (cam) markPending(id, p, shownValue(cam, p, sent));
+			}
 		});
 		c.input.placeholder = '—';
 		globalCtl[p] = c;
@@ -455,6 +460,11 @@ function renderGlobal() {
 }
 
 // ---------------------------------------------------------------- camera rows
+// A lens is sent as the phone's lens id but shown as mm (or its name for front lenses).
+function shownValue(cam, param, value) {
+	const lens = param === 'lens' && (cam.lensOptions || []).find(o => typeof o === 'object' && o.value === value);
+	return lens ? (lens.facing === 'front' ? (lens.label || 'Front') : lens.mm) : value;
+}
 function markPending(id, param, value) { pending[id + ':' + param] = { value, since: Date.now(), until: Date.now() + 3500 }; }
 function pendingFor(cam, param) {
 	const k = cam.id + ':' + param, p = pending[k];
@@ -516,11 +526,15 @@ function buildRow(cam) {
 	name.append(top, r.meta, r.err);
 	r.el.append(r.arm, name);
 	for (const p of ['letter', 'reel', 'lens', 'iris', 'iso', 'fps', 'shutter', 'wb', 'tint']) {
-		const c = combo(p, v => {
+		const c = combo(p, async v => {
 			if (p === 'letter') v = v.toUpperCase();
-			const lens = p === 'lens' && (r.cam.lensOptions || []).find(o => typeof o === 'object' && o.value === v);
-			markPending(cam.id, p, lens ? (lens.facing === 'front' ? (lens.label || 'Front') : lens.mm) : v);
-			act('/cameras/' + cam.id + '/set', { param: p, value: v });
+			markPending(cam.id, p, shownValue(r.cam, p, v));
+			// an out-of-range value comes back snapped (e.g. 2000 K -> 2500 K)
+			const res = await act('/cameras/' + cam.id + '/set', { param: p, value: v });
+			if (res && res.value !== undefined && !same(res.value, v)) {
+				markPending(cam.id, p, shownValue(r.cam, p, res.value));
+				c.input.value = fmt(shownValue(r.cam, p, res.value));
+			}
 		});
 		r.ctl[p] = c;
 		r.el.append(c);

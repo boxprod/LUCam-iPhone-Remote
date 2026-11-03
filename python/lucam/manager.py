@@ -6,6 +6,7 @@ so HTTP request handlers only ever read snapshots and queue commands.
 """
 
 import json
+import math
 import os
 import queue
 import re
@@ -42,6 +43,12 @@ def lens_names(lenses):
 			name = '{} ({})'.format(name, sum(1 for n in names.values() if n.startswith(name)) + 1)
 		names[l['id']] = name
 	return names
+
+
+def nearest_lens(lenses, mm):
+	"""The lens whose focal length is closest to mm (in stops, so 30 mm picks 24 over 48)."""
+	by_mm = {l['focalLength']: l for l in lenses}
+	return by_mm[nearest(mm, list(by_mm), log=True)]
 
 
 def format_f_stop(value):
@@ -133,6 +140,26 @@ def parse_shutter(value, measurement):
 	return {'speed': int(n)}
 
 
+def nearest(value, options, log=False):
+	"""The option closest to value; log=True compares ratios (stops), for ISO,
+	shutter and focal lengths."""
+	opts = [o for o in options if o is not None and (not log or o > 0)]
+	if not opts:
+		return value
+	if log and value > 0:
+		return min(opts, key=lambda o: abs(math.log(o / value)))
+	return min(opts, key=lambda o: abs(o - value))
+
+
+def clamp(value, rng):
+	if rng and rng[0] is not None and rng[1] is not None:
+		return max(rng[0], min(rng[1], value))
+	return value
+
+
+REEL_RANGE = (1, 999)
+
+
 def format_shutter(info):
 	if not info:
 		return None
@@ -175,6 +202,7 @@ class CameraWorker(threading.Thread):
 		self._lenses = []
 		self._monitor_displays = {p: [] for p in MONITOR_SWITCHES}   # displays that have each switch
 		self._iris_controllable = False
+		self._iris_range = (None, None)
 		self._device_format = None
 		self._device_dr = None
 		# Until one answers, cycle through the variants of what the user typed
@@ -424,6 +452,7 @@ class CameraWorker(threading.Thread):
 		self._iris_controllable = bool(idesc.get('controllable'))
 		rng = idesc.get('apertureStop') or {}
 		lo, hi = rng.get('min'), rng.get('max')
+		self._iris_range = (lo, hi)
 		if self._iris_controllable and lo is not None and hi is not None:
 			stops = sorted({round(lo, 2), round(hi, 2)} | {f for f in F_STOPS if lo - 0.01 <= f <= hi + 0.01})
 			upd['irisOptions'] = [format_f_stop(f) for f in stops]
@@ -726,15 +755,59 @@ class CameraWorker(threading.Thread):
 
 	# --- commands ---------------------------------------------------------------
 
+	def snap(self, param, value):
+		"""A value the camera can take: out-of-range values are clamped to the
+		range (WB, tint, iris, reel, zoom) or replaced by the nearest value the
+		camera lists (ISO, shutter, frame rate, lens). Unparseable values pass
+		through, to be refused when set."""
+		s = self.state
+		try:
+			if param in ('wb', 'tint'):
+				return int(round(clamp(float(value), s.get(param + 'Range'))))
+			if param == 'iso':
+				return int(nearest(float(value), s.get('isoOptions') or [], log=True))
+			if param == 'shutter':
+				parsed = parse_shutter(value, s.get('shutterMode'))
+				if parsed.get('angle') is not None:
+					raw = nearest(parsed['angle'] * self._angle_scale, self._shutter_options.get('shutterAngles') or [], log=True)
+					return format_shutter({'shutterAngle': raw})
+				return '1/{}'.format(int(nearest(parsed['speed'], self._shutter_options.get('shutterSpeeds') or [], log=True)))
+			if param == 'iris':
+				return format_f_stop(clamp(parse_f_stop(value), self._iris_range))
+			if param == 'fps':
+				opts = s.get('fpsOptions') or []
+				if str(value) in opts or not opts:
+					return str(value)
+				return min(opts, key=lambda o: abs(float(o) - float(value)))
+			if param == 'reel':
+				return int(clamp(int(float(value)), REEL_RANGE))
+			if param == 'lens':
+				v = str(value).strip()
+				names = lens_names(self._lenses)
+				if any(l['id'] == v or names[l['id']].lower() == v.lower() for l in self._lenses):
+					return v
+				mm = float(v.lower().replace('mm', ''))
+				back = [l for l in self._lenses if l.get('facing') != 'front' and l.get('focalLength')]
+				if back:
+					return nearest_lens(back, mm)['id']
+				return int(round(clamp(mm, s.get('lensRange'))))
+		except (ValueError, TypeError, ZeroDivisionError):
+			pass
+		return value
+
 	def queue_set(self, param, value):
+		"""Queue a setting; returns the value actually sent (see snap)."""
+		if param != 'focus':
+			value = self.snap(param, value)
 		if param == 'focus':
 			# Slider drags send many values: keep only the latest.
 			with self.manager.lock:
 				queued = self._focus_target is not None
 				self._focus_target = value
 			if queued:
-				return
+				return value
 		self.commands.put(('set', param, value))
+		return value
 
 	def queue(self, *cmd):
 		self.commands.put(cmd)
@@ -824,7 +897,8 @@ class CameraWorker(threading.Thread):
 			parsed = parse_shutter(value, self.state['shutterMode'])
 			angle = parsed.get('angle')
 			if angle is not None:
-				angle *= self._angle_scale
+				# the listed value exactly ('261.818°' is shown for 261.8181818...)
+				angle = nearest(angle * self._angle_scale, self._shutter_options.get('shutterAngles') or [], log=True)
 			self._lock_exposure()
 			c.set_shutter(speed=parsed.get('speed'), angle=angle)
 		elif param == 'wb':
@@ -1166,20 +1240,25 @@ class CameraManager:
 	def set_param(self, cam_id, param, value):
 		if param not in PARAMS:
 			raise ValueError('unknown parameter ' + str(param))
-		self._worker(cam_id).queue_set(param, value)
+		return self._worker(cam_id).queue_set(param, value)
 
 	def set_global(self, param, value):
-		"""Push one value to every active camera, overriding individual values."""
+		"""Push one value to every active camera, overriding individual values.
+		Returns what each camera was sent (out-of-range values snapped per camera)."""
 		if param not in PARAMS:
 			raise ValueError('unknown parameter ' + str(param))
 		with self.lock:
-			self.global_values[param] = value
 			# a fixed-aperture camera just keeps its iris
 			skip = {k for k, w in self.workers.items() if param == 'iris' and not w.state.get('irisControllable')}
+		sent = {}
 		for cam_id in self.active_ids():
 			if cam_id not in skip:
-				self.set_param(cam_id, param, value)
+				sent[cam_id] = self.set_param(cam_id, param, value)
+		with self.lock:
+			# the global row shows what the cameras got (the first one's, if they differ)
+			self.global_values[param] = next(iter(sent.values()), value)
 		self._save_later()
+		return sent
 
 	def auto_wb(self, cam_ids):
 		for cam_id in cam_ids:
@@ -1469,8 +1548,7 @@ class CameraManager:
 			self.discover(p.get('mode', 'bonjour'))
 			return None
 		if parts == ['global', 'set']:
-			self.set_global(p['param'], p['value'])
-			return None
+			return {'ok': True, 'values': self.set_global(p['param'], p['value'])}
 		if parts == ['global', 'record']:
 			self.record_all(bool(p['recording']))
 			return None
@@ -1493,7 +1571,7 @@ class CameraManager:
 			elif action == 'update':
 				self.update_camera(cam_id, p.get('name'), p.get('active'))
 			elif action == 'set':
-				self.set_param(cam_id, p['param'], p['value'])
+				return {'ok': True, 'value': self.set_param(cam_id, p['param'], p['value'])}
 			elif action == 'record':
 				self.record([cam_id], bool(p['recording']))
 			elif action == 'autowb':
