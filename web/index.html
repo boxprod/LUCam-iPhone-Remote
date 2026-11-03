@@ -18,7 +18,8 @@
 	--rec: #e8322b;
 	--rec-dim: #5a1714;
 	--radius: 6px;
-	--cols: 34px minmax(190px, 1.6fr) 62px 66px 150px 86px 80px 86px 86px 92px 112px 92px minmax(120px, .9fr) 92px 64px;
+	/* minimums add up (with gaps and padding) to .table's min-width, which fits a 1440 px window */
+	--cols: 34px minmax(182px, 1.6fr) 54px 58px minmax(130px, 1fr) 78px 78px 78px 78px 84px 96px 80px minmax(120px, .9fr) 84px 64px;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--text); }
@@ -53,9 +54,9 @@ a.btn { text-decoration: none; color: var(--text); }
 .btn.stop { min-width: 84px; font-weight: 700; letter-spacing: .06em; }
 
 main { padding: 12px 16px 40px; }
-.table { min-width: 1338px; }
+.table { min-width: 1404px; }
 .scroll { overflow-x: auto; }
-.row { display: grid; grid-template-columns: var(--cols); gap: 8px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 6px; }
+.row { display: grid; grid-template-columns: var(--cols); gap: 6px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 6px; }
 .row.head { background: none; border: none; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding-top: 0; padding-bottom: 2px; margin-bottom: 2px; }
 .row.global { background: #1a1712; border-color: #4a3a1c; }
 .row.global .label { color: var(--accent); font-weight: 650; }
@@ -186,7 +187,7 @@ main { padding: 12px 16px 40px; }
 	<div class="scroll">
 		<div class="table">
 			<div class="row head">
-				<div></div><div>Camera</div><div>Cam</div><div>Reel</div><div>Format</div><div>Lens mm</div><div>Iris</div><div>ISO</div><div>FPS</div><div>Shutter</div><div>WB K</div><div>Tint</div><div>Timecode / next clip</div><div></div><div></div>
+				<div></div><div>Camera</div><div>Cam</div><div>Reel</div><div>Format</div><div>Lens mm</div><div>Iris</div><div>ISO</div><div>FPS</div><div>Shutter</div><div>WB K</div><div>Tint</div><div title="Timecode / next clip">TC / next clip</div><div></div><div></div>
 			</div>
 			<div class="row global" id="globalRow"></div>
 			<div id="camRows"></div>
@@ -638,7 +639,7 @@ function buildExpand(r, cam) {
 	r.cleanGroup = el('div', 'grp');
 	r.monitorSwitches = {};
 	x.append(fg, el('span', 'sep'), ag, el('span', 'sep'), lg, el('span', 'row-break'), buildPresets(r, cam),
-		el('span', 'sep'), r.lutGroup, el('span', 'sep'), r.cleanGroup);
+		el('span', 'sep'), r.lutGroup, el('span', 'sep'), r.cleanGroup, el('span', 'sep'), buildDevice(r));
 	r.expand = x;
 	r.el.append(x);
 	if (!x.hidden) loadPresets(r);
@@ -691,6 +692,14 @@ function buildPresets(r, cam) {
 	r.presetButtons = [download, apply, del];
 	r.presetAll = [r.presetSel, download, apply, del, save, upload];
 	g.append(el('span', 'lbl', 'Presets'), r.presetSel, download, apply, del, save, upload, file);
+	return g;
+}
+
+// Phone model and app version (moved here from under the camera name).
+function buildDevice(r) {
+	const g = el('div', 'grp');
+	r.device = el('span', 'note');
+	g.append(el('span', 'lbl', 'Device'), r.device);
 	return g;
 }
 
@@ -866,9 +875,10 @@ function renderRow(r, cam) {
 	r.dot.className = 'dot ' + (cam.recording ? 'bad' : cam.online ? 'ok' : cam.connecting ? 'wait' : 'bad');
 	r.dot.title = cam.online ? 'online' : cam.connecting ? 'connecting' : 'offline';
 	if (document.activeElement !== r.name) r.name.value = cam.name || cam.deviceName || cam.address;
-	const meta = [cam.address, cam.product, cam.software && 'v' + cam.software].filter(Boolean).join(' · ');
-	r.meta.textContent = meta;
-	r.meta.title = meta;
+	const device = [cam.product, cam.software && 'app ' + cam.software].filter(Boolean).join(' · ');
+	r.meta.textContent = cam.address;
+	r.meta.title = [cam.address, device].filter(Boolean).join(' · ');
+	r.device.textContent = device || (cam.online ? '…' : '–');
 	const fresh = cam.error && (Date.now() / 1000 - cam.errorTime < 20);
 	r.err.textContent = cam.liveWarning || (fresh ? cam.error : '');
 	r.err.title = cam.liveWarning || cam.error || '';
