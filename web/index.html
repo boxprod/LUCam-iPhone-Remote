@@ -268,8 +268,12 @@ const fmt = v => v === null || v === undefined || v === '' ? '' : String(v);
 const same = (a, b) => String(a).replace(/[°\s]/g, '').toLowerCase() === String(b).replace(/[°\s]/g, '').toLowerCase();
 
 function closeMenu() { if (openMenu) { openMenu.remove(); openMenu = null; } }
+// For a click on a menu's anchor: closes whatever menu is open and returns
+// true if it was this anchor's own (a toggle), false to go on and open it.
+function menuWasOpen(anchor) { const was = !!openMenu && openMenu.anchor === anchor; closeMenu(); return was; }
 document.addEventListener('mousedown', e => { if (openMenu && !openMenu.contains(e.target) && !e.target.closest('[data-menu-anchor]')) closeMenu(); });
-window.addEventListener('scroll', closeMenu, true);
+// close menus when the page scrolls, not when the menu itself scrolls
+window.addEventListener('scroll', e => { if (!(openMenu && openMenu.contains(e.target))) closeMenu(); }, true);
 
 function showMenu(anchor, items, current, onPick) {
 	closeMenu();
@@ -290,8 +294,10 @@ function showMenu(anchor, items, current, onPick) {
 	const h = Math.min(m.scrollHeight, 320);
 	m.style.left = Math.min(r.left, innerWidth - m.offsetWidth - 8) + 'px';
 	m.style.top = (r.bottom + h + 8 > innerHeight ? Math.max(8, r.top - h - 4) : r.bottom + 4) + 'px';
+	// centre the current value in the menu without scrolling the page
 	const cur = m.querySelector('.cur');
-	if (cur) cur.scrollIntoView({ block: 'center' });
+	if (cur) m.scrollTop = cur.offsetTop - (m.clientHeight - cur.offsetHeight) / 2;
+	m.anchor = anchor;
 	openMenu = m;
 }
 
@@ -324,7 +330,7 @@ function combo(param, onCommit) {
 	input.addEventListener('blur', () => { setTimeout(() => { if (document.activeElement !== input) input.value = fmt(wrap.current); }, 150); });
 	drop.addEventListener('mousedown', e => {
 		e.preventDefault();
-		if (openMenu) { closeMenu(); return; }
+		if (menuWasOpen(wrap)) return;
 		showMenu(wrap, wrap.options, wrap.menuCurrent != null ? wrap.menuCurrent : wrap.current, v => commit(v));
 	});
 	wrap.input = input;
@@ -544,7 +550,7 @@ function buildRow(cam) {
 			r.fmtNote = el('span', 'note');
 			r.fmt.append(r.fmtMain, r.fmtNote);
 			r.fmt.dataset.menuAnchor = '';
-			r.fmt.addEventListener('mousedown', e => { e.preventDefault(); if (openMenu) { closeMenu(); return; } showFormatPanel(r.fmt, r.cam); });
+			r.fmt.addEventListener('mousedown', e => { e.preventDefault(); if (menuWasOpen(r.fmt)) return; showFormatPanel(r.fmt, r.cam); });
 			r.el.append(r.fmt);
 		}
 	}
@@ -565,7 +571,7 @@ function buildRow(cam) {
 	more.dataset.menuAnchor = '';
 	more.addEventListener('mousedown', e => {
 		e.preventDefault();
-		if (openMenu) { closeMenu(); return; }
+		if (menuWasOpen(more)) return;
 		const items = [
 			{ label: 'Auto white balance', value: 'awb', text: true },
 			{ label: 'Open live view', value: 'live', text: true },
@@ -875,6 +881,7 @@ function showFormatPanel(anchor, cam) {
 	const r = anchor.getBoundingClientRect();
 	p.style.left = Math.min(r.left, innerWidth - p.offsetWidth - 8) + 'px';
 	p.style.top = (r.bottom + p.offsetHeight + 8 > innerHeight ? Math.max(8, r.top - p.offsetHeight - 4) : r.bottom + 4) + 'px';
+	p.anchor = anchor;
 	openMenu = p;
 }
 
