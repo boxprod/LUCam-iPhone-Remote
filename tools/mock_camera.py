@@ -34,6 +34,7 @@ def make_state(name, iris_controllable=True):
 		'irisControllable': iris_controllable,
 		'product': {'deviceName': name, 'productName': 'Blackmagic Camera (iPhone, simulated)', 'softwareVersion': '3.5.3'},
 		'recording': False,
+		'presets': {},
 		'recStart': 0,
 		'iso': 400,
 		'autoExposure': 'Off',
@@ -125,8 +126,25 @@ def make_handler(state, lock, verbose):
 				}
 			if p in routes:
 				self._send(200, routes[p])
+			elif p == '/presets':
+				self._send(200, {'presets': sorted(s['presets'])})
+			elif p.startswith('/presets/') and p[9:] in s['presets']:
+				body = s['presets'][p[9:]]
+				self.send_response(200)
+				self.send_header('Content-Type', 'application/octet-stream')
+				self.send_header('Content-Disposition', 'attachment; filename="{}.bmcpreset"'.format(p[9:]))
+				self.send_header('Content-Length', str(len(body)))
+				self.end_headers()
+				self.wfile.write(body)
 			else:
 				self._send(404, {'error': 'not found'})
+
+		def do_DELETE(self):
+			p = self._path()
+			with lock:
+				if p.startswith('/presets/') and state['presets'].pop(p[9:].replace('.bmcpreset', ''), None) is not None:
+					return self._send(204)
+			self._send(404, {'error': 'not found'})
 
 		def do_PUT(self):
 			self._write('PUT')
@@ -139,6 +157,12 @@ def make_handler(state, lock, verbose):
 			body = self._body()
 			s = state
 			with lock:
+				if p.startswith('/presets/') and method == 'PUT':
+					name = p[9:].replace('.bmcpreset', '')
+					snap = {'appsettings': {'hdmiOut': 0, 'droppedFrames': 'alert'}, 'camerasettings': {'iso': s['iso'], 'wb': s['wb']},
+							'secondaryControlsData': {'focusValue': 0.5}}
+					s['presets'][name] = json.dumps(snap).encode()
+					return self._send(204)
 				if p == '/transports/0/record':
 					rec = body.get('recording', True) if method == 'PUT' else True
 					if rec and not s['recording']:
