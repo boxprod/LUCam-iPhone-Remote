@@ -10,6 +10,8 @@ import math
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -216,6 +218,7 @@ class CameraWorker(threading.Thread):
 		self._next_fast = 0.0
 		self._next_full = 0.0
 		self._caps_dirty = True
+		self._rec_started = 0.0   # when the current recording began (ours or started on the phone)
 		self.unsupported = set()
 		self._shutter_options = {}
 		self._angle_scale = 1
@@ -234,6 +237,10 @@ class CameraWorker(threading.Thread):
 			'software': '',
 			'recording': False,
 			'recordPending': False,
+			# set when a recording ended without LUCam asking for it (the camera stopped it:
+			# dropped frames with "stop recording" on, full media, or a stop on the phone);
+			# cleared by the next REC. {'t', 'after', 'timecode'}
+			'stopAlert': None,
 			'timecode': None,
 			'streaming': None, 'streamBitrate': 0, 'liveOurs': False, 'livePath': None, 'liveWarning': None,
 			'lens': None, 'lensOptions': [], 'lensRange': None, 'lensNative': False, 'lensMain': None,
@@ -271,6 +278,21 @@ class CameraWorker(threading.Thread):
 	def _error(self, msg):
 		self._update(error=msg, errorTime=time.time())
 		self.manager._log('{}: {}'.format(self.state['name'] or self.state['address'], msg))
+
+	def _camera_stopped(self, tc):
+		"""The poll found the camera not recording when LUCam believed it was, and no STOP
+		was sent: the camera (or someone at the phone) ended the clip. With the app's
+		dropped-frames option on "stop recording" this is the live dropped-frame alarm."""
+		now = time.time()
+		after = now - self._rec_started if self._rec_started else None
+		alert = {'t': now, 'after': after, 'timecode': tc}
+		self._update(stopAlert=alert)
+		msg = 'RECORDING STOPPED BY THE CAMERA{}{} - LUCam sent no STOP (dropped frames with ' \
+			  '"stop recording" on, media full, or a stop on the phone)'.format(
+				  ' after {:.0f}s'.format(after) if after is not None else '',
+				  ' at tc {}'.format(tc) if tc else '')
+		self._error(msg)
+		self.manager.alert('{}: {}'.format(self.state['name'] or self.state['address'], msg))
 
 	def stop(self):
 		self._halt.set()
@@ -319,11 +341,15 @@ class CameraWorker(threading.Thread):
 				self.resolved = True
 				self.manager._save_later()
 			upd = {'online': True, 'connecting': False, 'lastSeen': time.time()}
-			if rec is not None and not self.state['recordPending']:
-				upd['recording'] = rec
 			tc = self._try('timecode', c.timecode)
 			if tc is not None:
 				upd['timecode'] = tc
+			if rec is not None and not self.state['recordPending']:
+				if rec and not self.state['recording']:
+					self._rec_started = time.time()       # started on the phone
+				elif self.state['recording'] and not rec:
+					self._camera_stopped(tc)
+				upd['recording'] = rec
 			fo = self._try('focus', c.focus)
 			if fo is not None:
 				upd['focus'] = self._hold_focus(fo)
@@ -1106,7 +1132,11 @@ class CameraWorker(threading.Thread):
 			return
 		try:
 			self.client.record(recording)
-			self._update(recording=bool(recording))
+			if recording:
+				self._rec_started = time.time()
+				self._update(recording=True, stopAlert=None)
+			else:
+				self._update(recording=False)
 		except api.ApiError as e:
 			self._error('{} failed ({})'.format('REC' if recording else 'STOP', e))
 		finally:
@@ -1131,6 +1161,7 @@ class CameraManager:
 		self.discovery = {'running': False, 'mode': None, 'results': [], 'error': None, 'finished': 0}
 		self._save_timer = None
 		self.live = livestream.LiveServer()
+		self.alert_sound = True                 # system notification + sound on alerts (macOS)
 		self.settings = {'interface': 'auto'}   # network interface for discovery / live view
 		self.http_port = None                   # set by server.py, for the panel address
 		self._load()
@@ -1193,6 +1224,24 @@ class CameraManager:
 			del self.log[:-50]
 		if self.files:
 			self.files.event(msg, t)
+
+	def alert(self, msg):
+		"""Something the operator must see now: logged with an ALERT prefix and, on a Mac,
+		shown as a system notification with a sound so it is heard even with the panel
+		in the background. `alert_sound` turns the notification off."""
+		self._log('ALERT ' + msg)
+		if not self.alert_sound or sys.platform != 'darwin':
+			return
+		def quote(s):
+			return s.replace('\\', '\\\\').replace('"', '\\"')
+		title, _, text = msg.partition(': ')
+		script = 'display notification "{}" with title "LUCam: {}" sound name "Sosumi"'.format(
+			quote(text[:200] or msg[:200]), quote(title[:40]))
+		try:
+			subprocess.Popen(['osascript', '-e', script], stdin=subprocess.DEVNULL,
+							 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		except OSError:
+			pass
 
 	def _observe_request(self, sent_at, host, port, method, path, status, took, error):
 		"""api.request_observer: every request any worker sends, written to the request log

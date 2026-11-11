@@ -96,6 +96,20 @@ Each run writes two files to `logs/` (next to `server.py`, or `--log-dir`):
 
 `--no-log` keeps the log in memory only, as before.
 
+### When a camera stops recording by itself
+
+If a camera that was recording is found stopped and LUCam did not send the STOP,
+the camera (or someone at the phone) ended the clip. The panel shows a blinking
+red line in the camera's row with the time, the timecode and how long the clip
+had run, plays three beeps, and keeps the line until the next REC; the log gets
+an `ALERT` line, and on a Mac a system notification with a sound appears even
+when the panel is in the background (`--no-alert-sound` turns that off).
+
+With the Blackmagic Camera app's dropped-frames option set to stop recording,
+this is a live dropped-frame alarm for every camera on the panel: the clip is
+lost from that moment, but you know within half a second, which camera, and at
+which timecode.
+
 ## 4. Using the UI
 
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.

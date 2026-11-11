@@ -43,11 +43,14 @@ def main():
 	ap.add_argument('--no-log', action='store_true', help='keep the log in memory only, write no files')
 	ap.add_argument('--no-request-log', action='store_true',
 					help='write the events file but not the file listing every request sent to the cameras')
+	ap.add_argument('--no-alert-sound', action='store_true',
+					help='no system notification and sound when a camera stops recording by itself (macOS)')
 	args = ap.parse_args()
 
 	manager = CameraManager(config_path=args.config, log_dir=None if args.no_log else args.log_dir,
 							log_requests=not args.no_request_log)
 	manager.http_port = args.port
+	manager.alert_sound = not args.no_alert_sound
 
 	class Handler(BaseHTTPRequestHandler):
 		def log_message(self, fmt, *a):
