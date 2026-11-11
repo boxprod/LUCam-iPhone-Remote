@@ -921,13 +921,13 @@ function renderRow(r, cam) {
 	if (stop) {
 		// stays until the next REC: the camera ended the clip by itself
 		const when = new Date(stop.t * 1000).toLocaleTimeString();
-		r.err.textContent = '⏹ STOPPED BY THE CAMERA ' + when + (stop.timecode ? ' · tc ' + stop.timecode : '') +
+		r.err.textContent = (stop.kind === 'lost' ? '⚠ LOST WHILE RECORDING ' : '⏹ STOPPED BY THE CAMERA ') + when + (stop.timecode ? ' · tc ' + stop.timecode : '') +
 			(stop.after != null ? ' · after ' + Math.round(stop.after) + 's' : '');
 		r.err.title = cam.error || '';
 		r.err.classList.add('alert');
 		if (r.alertSeen !== stop.t) {
 			r.alertSeen = stop.t;
-			toast((cam.name || cam.address) + ': recording stopped by the camera' + (stop.timecode ? ' at ' + stop.timecode : ''), 'bad');
+			toast((cam.name || cam.address) + (stop.kind === 'lost' ? ': camera lost while recording' : ': recording stopped by the camera') + (stop.timecode ? ' at ' + stop.timecode : ''), 'bad');
 			beep();
 		}
 	} else {

@@ -174,6 +174,7 @@ def format_shutter(info):
 
 
 class CameraWorker(threading.Thread):
+	LOST_WHILE_RECORDING = 10  # s offline while recording before the alarm
 	POLL_FAST = 0.5      # record state / timecode
 	POLL_FOCUS_LOCKED = 0.2   # while focus is locked: undo a tap to focus quickly
 	POLL_FULL = 3.0      # all settings
@@ -219,6 +220,7 @@ class CameraWorker(threading.Thread):
 		self._next_full = 0.0
 		self._caps_dirty = True
 		self._rec_started = 0.0   # when the current recording began (ours or started on the phone)
+		self._offline_since = 0.0
 		self.unsupported = set()
 		self._shutter_options = {}
 		self._angle_scale = 1
@@ -285,7 +287,7 @@ class CameraWorker(threading.Thread):
 		dropped-frames option on "stop recording" this is the live dropped-frame alarm."""
 		now = time.time()
 		after = now - self._rec_started if self._rec_started else None
-		alert = {'t': now, 'after': after, 'timecode': tc}
+		alert = {'t': now, 'after': after, 'timecode': tc, 'kind': 'stopped'}
 		self._update(stopAlert=alert)
 		msg = 'RECORDING STOPPED BY THE CAMERA{}{} - LUCam sent no STOP (dropped frames with ' \
 			  '"stop recording" on, media full, or a stop on the phone)'.format(
@@ -364,6 +366,14 @@ class CameraWorker(threading.Thread):
 				return
 			if self.state['online'] or self.state['connecting']:
 				self._error('offline ({})'.format(e))
+				self._offline_since = time.time()
+			elif self.state['recording'] and not self.state['stopAlert'] and self._offline_since \
+					and time.time() - self._offline_since > self.LOST_WHILE_RECORDING:
+				# a recording camera that stays unreachable: the app died or was left
+				self._update(stopAlert={'t': time.time(), 'after': None, 'timecode': self.state.get('timecode'), 'kind': 'lost'})
+				self.manager.alert('{}: RECORDING CAMERA LOST for {:.0f}s (app not answering: crashed, closed or '
+								   'phone locked?) last tc {}'.format(self.state['name'] or self.state['address'],
+								   time.time() - self._offline_since, self.state.get('timecode')))
 			self._update(online=False, connecting=False)
 			self._caps_dirty = True
 			self._next_fast = self._next_full = now + self.RETRY_OFFLINE
