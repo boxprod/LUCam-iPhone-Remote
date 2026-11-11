@@ -350,11 +350,12 @@ class CameraWorker(threading.Thread):
 			if rec is not None and not self.state['recordPending']:
 				if rec and not self.state['recording']:
 					self._rec_started = time.time()       # started on the phone
+				elif self.state['recording'] and not rec and time.time() - self._rec_started < self.REC_GRACE:
+					rec = None  # the camera is still opening its file (1.2 s on an SSD); keep 'recording'
 				elif self.state['recording'] and not rec:
-					if time.time() - self._rec_started < self.REC_GRACE:
-						return  # the camera is still opening its file (1.2 s on an SSD); ask again
 					self._camera_stopped(tc)
-				upd['recording'] = rec
+				if rec is not None:
+					upd['recording'] = rec
 			fo = self._try('focus', c.focus)
 			if fo is not None:
 				upd['focus'] = self._hold_focus(fo)
