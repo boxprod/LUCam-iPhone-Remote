@@ -175,6 +175,7 @@ def format_shutter(info):
 
 class CameraWorker(threading.Thread):
 	LOST_WHILE_RECORDING = 10  # s offline while recording before the alarm
+	REC_GRACE = 3.0            # s after REC during which 'not recording' is not an alarm
 	POLL_FAST = 0.5      # record state / timecode
 	POLL_FOCUS_LOCKED = 0.2   # while focus is locked: undo a tap to focus quickly
 	POLL_FULL = 3.0      # all settings
@@ -350,6 +351,8 @@ class CameraWorker(threading.Thread):
 				if rec and not self.state['recording']:
 					self._rec_started = time.time()       # started on the phone
 				elif self.state['recording'] and not rec:
+					if time.time() - self._rec_started < self.REC_GRACE:
+						return  # the camera is still opening its file (1.2 s on an SSD); ask again
 					self._camera_stopped(tc)
 				upd['recording'] = rec
 			fo = self._try('focus', c.focus)
