@@ -110,6 +110,18 @@ this is a live dropped-frame alarm for every camera on the panel: the clip is
 lost from that moment, but you know within half a second, which camera, and at
 which timecode.
 
+### Dumping every camera's settings
+
+A preset is a JSON file of the app's whole configuration, so saving the current
+settings as a preset and downloading it is a snapshot of the phone as it is now:
+
+    python3 tools/dump_settings.py                    # the cameras in cameras.json
+    python3 tools/dump_settings.py 192.168.1.20 ...   # given addresses
+
+writes one folder per camera (snapshot + the presets stored on the phone) and a
+`compare.txt` listing the settings that differ between the cameras. The snapshot
+preset is removed from the phone afterwards (`--keep` leaves it).
+
 ## 4. Using the UI
 
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.
