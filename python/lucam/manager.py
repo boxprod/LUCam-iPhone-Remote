@@ -15,7 +15,7 @@ import time
 import urllib.parse
 import uuid
 
-from . import api, discovery, filelog, livestream
+from . import api, discovery, events, filelog, livestream
 
 PARAMS = ('lens', 'iso', 'fps', 'shutter', 'wb', 'tint', 'letter', 'reel', 'codec', 'resolution', 'colorspace',
 		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut', 'cleanfeed', 'iris')
@@ -171,11 +171,26 @@ def format_shutter(info):
 	return None
 
 
+# What the controller reads from a camera, path -> the key that marks it unsupported.
+# Read with GETs (polling) or, when the camera offers it, pushed over its WebSocket.
+FAST_PATHS = ['/transports/0/record', '/transports/0/timecode', '/lens/focus']
+SETTING_PATHS = ['/video/iso', '/video/shutter', '/video/whiteBalance', '/video/whiteBalanceTint', '/system/format',
+				 '/system/dynamicRange', '/lens/focus/autoFocus', '/lens/iris', '/lens/zoom', '/lens/cameras/active',
+				 '/slates/nextClip', '/livestreams/0', '/livestreams/0/activePlatform']
+PATH_KEYS = {'/transports/0/record': 'record', '/transports/0/timecode': 'timecode', '/lens/focus': 'focus',
+			 '/video/iso': 'iso', '/video/shutter': 'shutter', '/video/whiteBalance': 'wb', '/video/whiteBalanceTint': 'tint',
+			 '/system/format': 'fps', '/system/dynamicRange': 'colorspace', '/lens/focus/autoFocus': 'autofocus',
+			 '/lens/iris': 'iris', '/lens/zoom': 'lens', '/lens/cameras/active': 'lenscams', '/slates/nextClip': 'slate',
+			 '/livestreams/0': 'stream', '/livestreams/0/activePlatform': 'stream'}
+
+
 class CameraWorker(threading.Thread):
 	POLL_FAST = 0.5      # record state / timecode
 	POLL_FOCUS_LOCKED = 0.2   # while focus is locked: undo a tap to focus quickly
 	POLL_FULL = 3.0      # all settings
+	POLL_PUSHED = 10.0   # with the camera pushing changes: only what it can't push
 	RETRY_OFFLINE = 2.0
+	RETRY_EVENTS = 5.0   # after the push channel dropped while the camera still answers
 
 	def __init__(self, manager, cam_id, address, name='', active=True, live_mode=False, saved_format=None,
 				 focus_locked=False, wb_hold=None, focus_hold=None):
@@ -220,6 +235,13 @@ class CameraWorker(threading.Thread):
 		self._shutter_options = {}
 		self._angle_scale = 1
 		self._zero_bitrate_since = None
+		# Push channel (see events.py): while it's up, `pushed` holds the paths the
+		# camera sends on its own and polling only reads the others, every 10 s.
+		self.events = None
+		self.pushed = set()
+		self._events_retry_at = 0.0
+		self._active_platform = None
+		self._stream_status = None
 		self.state = {
 			'id': cam_id,
 			'name': name,
@@ -254,6 +276,7 @@ class CameraWorker(threading.Thread):
 			'letter': None, 'reel': None, 'clipName': None,
 			'unsupported': [],
 			'lastSeen': 0,
+			'updates': 'poll',   # 'push' while the camera sends its changes itself
 		}
 
 	# --- thread-safe accessors ---------------------------------------------
@@ -274,6 +297,7 @@ class CameraWorker(threading.Thread):
 
 	def stop(self):
 		self._halt.set()
+		self._stop_events()
 		self.commands.put(None)
 
 	# --- main loop ------------------------------------------------------------
@@ -308,39 +332,120 @@ class CameraWorker(threading.Thread):
 				self.unsupported.add(key)
 			return None
 
+	def _read(self, path):
+		"""GET one of the paths above: its answer, or None if this camera lacks it.
+		Raises ApiError only when the camera doesn't answer."""
+		key = PATH_KEYS.get(path)
+		if key is None:   # a display switch: some displays lack some switches
+			try:
+				return self.client.get(path)
+			except api.ApiError as e:
+				if e.status == 0:
+					raise
+				return None
+		return self._try(key, self.client.get, path)
+
 	def _poll(self):
 		now = time.monotonic()
-		c = self.client
 		try:
 			if self._caps_dirty or not self.state['online']:
 				self._load_capabilities()
-			rec = self._try('record', c.is_recording)
+			if self.pushed:
+				# The camera pushes its changes: read only what it can't push.
+				upd = {}
+				for path in self._wanted_paths():
+					if path not in self.pushed:
+						self._merge(upd, self._apply(path, self._read(path)))
+				self._update(**upd)
+				self._next_fast = self._next_full = now + self.POLL_PUSHED
+				return
+			upd = {}
+			for path in FAST_PATHS:
+				self._merge(upd, self._apply(path, self._read(path)))
 			if not self.resolved:
 				self.resolved = True
 				self.manager._save_later()
-			upd = {'online': True, 'connecting': False, 'lastSeen': time.time()}
-			if rec is not None and not self.state['recordPending']:
-				upd['recording'] = rec
-			tc = self._try('timecode', c.timecode)
-			if tc is not None:
-				upd['timecode'] = tc
-			fo = self._try('focus', c.focus)
-			if fo is not None:
-				upd['focus'] = self._hold_focus(fo)
+			upd.update(online=True, connecting=False, lastSeen=time.time())
 			self._update(**upd)
 			if now >= self._next_full:
 				self._poll_settings()
 				self._next_full = now + self.POLL_FULL
 			self._next_fast = now + (self.POLL_FOCUS_LOCKED if self.focus_locked else self.POLL_FAST)
+			self._start_events()
 		except api.ApiError as e:
 			if not self.resolved and self._try_other_addresses():
 				self._next_fast = self._next_full = 0
 				return
 			if self.state['online'] or self.state['connecting']:
 				self._error('offline ({})'.format(e))
+			self._stop_events()
 			self._update(online=False, connecting=False)
 			self._caps_dirty = True
 			self._next_fast = self._next_full = now + self.RETRY_OFFLINE
+
+	# --- push channel ---------------------------------------------------------------
+
+	def _monitor_paths(self):
+		return ['/monitoring/{}/{}'.format(urllib.parse.quote(d), feature)
+				for param, (feature, _) in MONITOR_SWITCHES.items() for d in self._monitor_displays[param]]
+
+	def _wanted_paths(self):
+		"""Everything the panel shows, as API paths."""
+		paths = FAST_PATHS + SETTING_PATHS + self._monitor_paths()
+		return [p for p in paths if p != '/lens/cameras/active' or self._lenses]
+
+	def _start_events(self):
+		"""Once the camera answers and its capabilities are known, subscribe to its
+		changes. Cameras (or app versions) without the push channel stay polled."""
+		if self.events or 'events' in self.unsupported or time.monotonic() < self._events_retry_at:
+			return
+		listed = self._try('events', self.client.get, '/event/list')
+		listed = set((listed or {}).get('events') or []) if isinstance(listed, dict) else set(listed or [])
+		props = [p for p in self._wanted_paths() if p in listed]
+		if not props:
+			self.unsupported.add('events')
+			return
+		stream = events.EventStream(self.client, props, on_values=lambda v: self.commands.put(('values', v)),
+									on_closed=lambda reason: self.commands.put(('events-closed', stream, reason)))
+		self.events = stream
+		stream.start()
+
+	def _stop_events(self):
+		stream, self.events = self.events, None
+		self.pushed = set()
+		self._update(updates='poll')
+		if stream:
+			stream.stop()
+
+	def _on_values(self, values):
+		"""Values pushed by the camera (the current ones right after subscribing)."""
+		stream = self.events
+		if stream is None:
+			return
+		if not self.pushed:
+			self.pushed = set(stream.properties)
+			self._update(updates='push')
+			self.manager._log('{}: the camera now pushes its changes ({} values)'.format(
+				self.state['name'] or self.state['address'], len(self.pushed)))
+			self._next_fast = self._next_full = time.monotonic() + self.POLL_PUSHED
+		upd = {'online': True, 'connecting': False, 'lastSeen': time.time()}
+		for path, value in values.items():
+			self._merge(upd, self._apply(path, value))
+		self._update(**upd)
+
+	def _on_events_closed(self, stream, reason):
+		if stream is not self.events:
+			return   # an old stream, already replaced or stopped
+		self.events = None
+		was_pushing = bool(self.pushed)
+		self.pushed = set()
+		self._update(updates='poll')
+		if reason.startswith('no event socket'):
+			self.unsupported.add('events')   # this app version has no push channel: keep polling
+		self._events_retry_at = time.monotonic() + self.RETRY_EVENTS
+		if was_pushing:
+			self.manager._log('{}: push channel closed ({}), polling'.format(self.state['name'] or self.state['address'], reason))
+		self._next_fast = self._next_full = 0   # poll now: is the camera still there?
 
 	def _start_live(self):
 		"""Point the camera's live stream at our MediaMTX and start it."""
@@ -391,6 +496,7 @@ class CameraWorker(threading.Thread):
 	def _reconnect(self):
 		"""Drop everything learned about the camera and connect from scratch:
 		fresh client, re-resolve the address, re-read capabilities."""
+		self._stop_events()
 		self.unsupported.clear()
 		self._shutter_options = {}
 		self._angle_scale = 1
@@ -493,85 +599,103 @@ class CameraWorker(threading.Thread):
 		self._caps_dirty = False
 
 	def _poll_settings(self):
-		c = self.client
 		upd = {}
-		v = self._try('iso', c.iso)
-		if v is not None:
-			upd['iso'] = v
-		sh = self._try('shutter', c.shutter)
-		if sh:
-			upd['shutter'] = format_shutter(sh)
-			mode = 'ShutterAngle' if sh.get('shutterSpeed') is None and sh.get('shutterAngle') is not None else 'ShutterSpeed'
+		for path in SETTING_PATHS + self._monitor_paths():
+			if path == '/lens/cameras/active' and not self._lenses:
+				continue
+			if path == '/livestreams/0/activePlatform' and self._stream_status in (None, 'Idle'):
+				continue   # only matters while streaming (read just before)
+			self._merge(upd, self._apply(path, self._read(path)))
+		self._update(**upd)
+
+	def _merge(self, upd, part):
+		"""Add one path's changes to upd; the display switches are one dict per
+		feature ({'Device': .., 'HDMI': ..}) that each display's path adds to."""
+		for k, v in part.items():
+			if k in ('displayLuts', 'cleanFeeds'):
+				upd[k] = dict(upd.get(k, self.state.get(k) or {}), **v)
+			else:
+				upd[k] = v
+
+	def _apply(self, path, v):
+		"""State changes for one path's value (a GET answer or a pushed value)."""
+		if not isinstance(v, dict):
+			return {}
+		if path == '/transports/0/record':
+			return {} if self.state['recordPending'] else {'recording': bool(v.get('recording'))}
+		if path == '/transports/0/timecode':
+			return {'timecode': v['display']} if v.get('display') is not None else {}
+		if path == '/lens/focus':
+			fo = v.get('normalised', v.get('normalized'))
+			return {'focus': self._hold_focus(fo)} if fo is not None else {}
+		if path == '/video/iso':
+			return {'iso': v['iso']} if v.get('iso') is not None else {}
+		if path == '/video/shutter':
+			upd = {'shutter': format_shutter(v)}
+			mode = 'ShutterAngle' if v.get('shutterSpeed') is None and v.get('shutterAngle') is not None else 'ShutterSpeed'
 			upd['shutterMode'] = mode
-			if mode == 'ShutterAngle':
-				self._angle_scale = 100 if sh['shutterAngle'] > 360 else 1
 			opts = self._shutter_options
 			if mode == 'ShutterAngle':
+				self._angle_scale = 100 if v['shutterAngle'] > 360 else 1
 				upd['shutterOptions'] = [format_shutter({'shutterAngle': a}) for a in opts.get('shutterAngles', [])]
 			else:
-				upd['shutterOptions'] = ['1/{}'.format(s) for s in opts.get('shutterSpeeds', [])]
-		v = self._try('wb', c.white_balance)
-		if v is not None:
-			upd['wb'] = v
-		v = self._try('tint', c.tint)
-		if v is not None:
-			upd['tint'] = v
-		self._restore_wb(upd)
-		fmt = self._try('fps', c.format)
-		if fmt:
-			fr = fmt.get('frameRate')
-			if self._device_format and fr != self._device_format.get('frameRate'):
+				upd['shutterOptions'] = ['1/{}'.format(x) for x in opts.get('shutterSpeeds', [])]
+			return upd
+		if path in ('/video/whiteBalance', '/video/whiteBalanceTint'):
+			key, field = ('wb', 'whiteBalance') if path == '/video/whiteBalance' else ('tint', 'whiteBalanceTint')
+			if v.get(field) is None:
+				return {}
+			upd = {key: v[field]}
+			self._restore_wb(upd)
+			return upd
+		if path == '/system/format':
+			if self._device_format and v.get('frameRate') != self._device_format.get('frameRate'):
 				self._caps_dirty = True  # shutter/ISO lists can depend on frame rate
-			if self._device_format and fmt.get('recordResolution') != self._device_format.get('recordResolution'):
+			if self._device_format and v.get('recordResolution') != self._device_format.get('recordResolution'):
 				self._caps_dirty = True  # turning the phone swaps its format list (vertical crops)
-			self._device_format = fmt
-			dr = self._try('colorspace', c.dynamic_range)
-			if dr is not None:
-				self._device_dr = dr
-			upd.update(self._format_state())
-		for param, (feature, key) in MONITOR_SWITCHES.items():
-			values = {}
-			for name in self._monitor_displays[param]:
-				try:
-					values[name] = c.monitor_switch(name, feature)
-				except api.ApiError as e:
-					if e.status == 0:
-						raise
-			upd[key] = values
-		af = self._try('autofocus', c.autofocus)
-		if af:
-			upd['autofocusSupported'] = bool(af.get('supported', True))
-			upd['autofocus'] = 'Continuous' if af.get('enabled') and af.get('mode') == 'Continuous' else 'Off'
-		ir = self._try('iris', c.iris)
-		if ir and ir.get('apertureStop') is not None:
-			upd['iris'] = format_f_stop(ir['apertureStop'])
-			upd['irisAuto'] = bool(ir.get('continuousApertureAutoExposure'))
-		z = self._try('lens', c.zoom)
-		if z:
-			upd['lens'] = z.get('focalLength')
-		if self._lenses:
-			active = self._try('lenscams', c.get, '/lens/cameras/active')
-			if active:
-				upd['lensId'] = active.get('id')
-				if active.get('facing') == 'front':
-					upd['lens'] = lens_names(self._lenses).get(active.get('id'), 'Front')
-		sl = self._try('slate', c.slate)
-		if sl:
-			upd['letter'] = (sl.get('project') or {}).get('camera')
-			upd['reel'] = (sl.get('clip') or {}).get('reel')
-			upd['clipName'] = (sl.get('clip') or {}).get('clipName')
-		st = self._try('stream', c.stream_status)
-		if st:
-			status, bitrate = st.get('status'), st.get('bitrate') or 0
-			upd['streaming'] = status
-			upd['streamBitrate'] = bitrate
-			if status not in (None, 'Idle'):
-				plat = self._try('stream', c.active_platform) or {}
-				upd['liveOurs'] = plat.get('platform') == livestream.PLATFORM_ID
-			else:
-				upd['liveOurs'] = False
-			upd['liveWarning'] = self._stream_warning(status, bitrate, st.get('effectiveVideoFormat'))
-		self._update(**upd)
+			self._device_format = v
+			return self._format_state()
+		if path == '/system/dynamicRange':
+			if v.get('dynamicRange') is not None:
+				self._device_dr = v['dynamicRange']
+			return self._format_state()
+		if path.startswith('/monitoring/'):
+			display, feature = [urllib.parse.unquote(x) for x in path.split('/')[2:4]]
+			for param, (feat, key) in MONITOR_SWITCHES.items():
+				if feat == feature:
+					return {key: {display: bool(v.get('enabled'))}}   # merged by _merge
+			return {}
+		if path == '/lens/focus/autoFocus':
+			return {'autofocusSupported': bool(v.get('supported', True)),
+					'autofocus': 'Continuous' if v.get('enabled') and v.get('mode') == 'Continuous' else 'Off'}
+		if path == '/lens/iris':
+			if v.get('apertureStop') is None:
+				return {}
+			return {'iris': format_f_stop(v['apertureStop']), 'irisAuto': bool(v.get('continuousApertureAutoExposure'))}
+		if path == '/lens/zoom':
+			# a front lens is shown by name (set from /lens/cameras/active)
+			front = self.state.get('lensId') in {l['id'] for l in self._lenses if l.get('facing') == 'front'}
+			return {} if front or v.get('focalLength') is None else {'lens': v['focalLength']}
+		if path == '/lens/cameras/active':
+			upd = {'lensId': v.get('id')}
+			if v.get('facing') == 'front':
+				upd['lens'] = lens_names(self._lenses).get(v.get('id'), 'Front')
+			elif v.get('focalLength') is not None and not isinstance(self.state.get('lens'), (int, float)):
+				upd['lens'] = v['focalLength']   # back from a front lens (a name); zoom refines it
+			return upd
+		if path == '/slates/nextClip':
+			return {'letter': (v.get('project') or {}).get('camera'), 'reel': (v.get('clip') or {}).get('reel'),
+					'clipName': (v.get('clip') or {}).get('clipName')}
+		if path == '/livestreams/0':
+			status, bitrate = v.get('status'), v.get('bitrate') or 0
+			self._stream_status = status
+			ours = status not in (None, 'Idle') and (self._active_platform or {}).get('platform') == livestream.PLATFORM_ID
+			return {'streaming': status, 'streamBitrate': bitrate, 'liveOurs': ours,
+					'liveWarning': self._stream_warning(status, bitrate, v.get('effectiveVideoFormat'))}
+		if path == '/livestreams/0/activePlatform':
+			self._active_platform = v
+			return {'liveOurs': self._stream_status not in (None, 'Idle') and v.get('platform') == livestream.PLATFORM_ID}
+		return {}
 
 	# --- recording format -------------------------------------------------------
 
@@ -820,12 +944,14 @@ class CameraWorker(threading.Thread):
 				param, value = args
 				label = 'set {}'.format(param)
 				self._set(param, value)
-				self._next_full = 0  # read back promptly
+				if not self.pushed:
+					self._next_full = 0  # read back promptly (pushed cameras send the change)
 			elif kind == 'autowb':
 				label = 'auto WB'
 				c.auto_white_balance()
 				self.release_wb_hold()
-				self._next_full = 0
+				if not self.pushed:
+					self._next_full = 0
 			elif kind == 'stream':
 				label = 'live view'
 				if args[0]:
@@ -843,6 +969,10 @@ class CameraWorker(threading.Thread):
 				self._next_full = 0
 			elif kind == 'refresh':
 				self._reconnect()
+			elif kind == 'values':
+				self._on_values(args[0])
+			elif kind == 'events-closed':
+				self._on_events_closed(*args)
 		except api.ApiError as e:
 			self._error('{} failed ({})'.format(label, e))
 		except (ValueError, TypeError) as e:

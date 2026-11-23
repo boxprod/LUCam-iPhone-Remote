@@ -158,6 +158,28 @@ too (System Settings > General > Date & Time > Set time automatically).
 - Cameras are listed by camera letter (A, B, C…), here and in Multiview. Cameras whose letter isn't known yet (connecting, offline) come last.
 - **⋯** menu: auto white balance, open/stop live view, reconnect, remove.
 
+## How the panel stays up to date
+
+The Blackmagic Camera app can push its changes: the controller opens one
+WebSocket to each phone (`/control/api/v1/event/websocket`), subscribes to
+everything the panel shows, and the phone sends a message whenever a value
+changes, whether it was changed from here or on the phone itself. Writes still
+go through ordinary PUT/POST requests.
+
+- **Requests**: about 0.2 a second per phone (the autofocus mode and the phone
+  screen's LUT switch, which the app can't push, read every 10 s), instead of
+  about 11 when polling. On connecting, and after a format change, the
+  controller also reads the phone's capabilities once (about 40 requests).
+- **Speed**: changes show up within a fraction of a second. While recording,
+  the phone pushes the timecode on every frame.
+- **Falling back**: if the push channel drops (the app goes to the background,
+  the phone dies or leaves the network), the controller polls again, shows the
+  phone offline within a couple of seconds, and subscribes again once it's back.
+  A phone or app version without the push channel is simply polled, as before.
+
+The expanded row's Device line says which a phone is on: "changes pushed by the
+camera" or "polled".
+
 ## Network interfaces
 
 With several network interfaces (Wi-Fi, Ethernet adapters, VPN), use the
@@ -264,7 +286,9 @@ python3 server.py --config /tmp/test-cameras.json --open
 
 The first command starts three simulated cameras (registered with Bonjour). The
 second runs the controller with a separate camera list. Then add the mocks
-through Discover. The mocks don't stream video.
+through Discover. The mocks don't stream video. They push their changes like
+the app does; `--no-events` makes them behave like an app without the push
+channel, so the controller polls them.
 
 ## Notes from real-iPhone testing
 

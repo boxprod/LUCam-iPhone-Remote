@@ -899,7 +899,11 @@ function renderRow(r, cam) {
 	const device = [cam.product, cam.software && 'app ' + cam.software].filter(Boolean).join(' · ');
 	r.meta.textContent = cam.address;
 	r.meta.title = [cam.address, device].filter(Boolean).join(' · ');
-	r.device.textContent = device || (cam.online ? '…' : '–');
+	r.device.textContent = (device || (cam.online ? '…' : '–'))
+		+ (cam.online ? (cam.updates === 'push' ? ' · changes pushed by the camera' : ' · polled') : '');
+	r.device.title = cam.updates === 'push'
+		? 'The camera sends its changes over a WebSocket: few requests, instant updates'
+		: 'The controller asks the camera for its values ~11 times a second';
 	const fresh = cam.error && (Date.now() / 1000 - cam.errorTime < 20);
 	r.err.textContent = cam.liveWarning || (fresh ? cam.error : '');
 	r.err.title = cam.liveWarning || cam.error || '';
