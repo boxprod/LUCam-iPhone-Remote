@@ -1116,7 +1116,8 @@ class CameraWorker(threading.Thread):
 
 
 class CameraManager:
-	def __init__(self, config_path=None, web_dir=WEB_DIR, autosave=True, log_dir=None, log_requests=True):
+	def __init__(self, config_path=None, web_dir=WEB_DIR, autosave=True, log_dir=None, log_requests=True,
+				 log_keep_days=30):
 		self.lock = threading.RLock()
 		self.config_path = config_path
 		self.web_dir = web_dir
@@ -1125,7 +1126,8 @@ class CameraManager:
 		self.global_values = {}
 		self.log = []
 		# log_dir: folder for the run's log files (None: in-memory log only, as in the panel)
-		self.files = filelog.FileLog(log_dir, requests=log_requests) if log_dir else None
+		self.files = filelog.FileLog(log_dir, requests=log_requests, keep_days=log_keep_days) if log_dir else None
+		self._by_address = {}   # (host, port) -> worker, for naming requests in the log
 		if self.files:
 			api.request_observer = self._observe_request
 		self.discovery = {'running': False, 'mode': None, 'results': [], 'error': None, 'finished': 0}
@@ -1194,19 +1196,17 @@ class CameraManager:
 		if self.files:
 			self.files.event(msg, t)
 
-	def _observe_request(self, sent_at, host, port, method, path, status, took, error):
+	def _observe_request(self, sent_at, host, port, method, path, status, took, error, sent):
 		"""api.request_observer: every request any worker sends, written to the request log
 		under the camera's name (or its address while it has none)."""
-		name = host
-		with self.lock:
-			for w in self.workers.values():
-				try:
-					if api.parse_address(w.client.address)[1:] == (host, port):
-						name = w.state['name'] or host
-						break
-				except ValueError:
-					pass
-		self.files.request(sent_at, name, method, path, status, took, error)
+		w = self._by_address.get((host, port))
+		if w is None or w.client.host != host or w.client.port != port:
+			# a camera added, or one now reached on another address: rebuild the map
+			with self.lock:
+				self._by_address = {(x.client.host, x.client.port): x for x in self.workers.values()}
+			w = self._by_address.get((host, port))
+		name = (w.state['name'] or w.state['deviceName'] or host) if w else host
+		self.files.request(sent_at, name, method, path, status, took, error, sent)
 
 	# --- cameras ------------------------------------------------------------------
 

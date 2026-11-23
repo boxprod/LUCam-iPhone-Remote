@@ -18,9 +18,10 @@ _UNVERIFIED_SSL = ssl.create_default_context()
 _UNVERIFIED_SSL.check_hostname = False
 _UNVERIFIED_SSL.verify_mode = ssl.CERT_NONE
 
-# Called after every request as (sent_at, host, port, method, path, status, seconds, error).
-# status is 0 when the camera did not answer; error is '' on success. Set by the manager
-# to write the request log; must not raise.
+# Called after every request as (sent_at, host, port, method, path, status, seconds, error, sent).
+# status is 0 when the camera did not answer; error is '' on success; sent is what a write
+# carried (its JSON, or '<N bytes>' for a file), '' for a GET. Set by the manager to write
+# the request log; must not raise.
 request_observer = None
 
 
@@ -93,6 +94,7 @@ class CameraClient:
 			headers['Content-Type'] = 'application/json'
 		req = urllib.request.Request(self.base_url + path, data=data, method=method, headers=headers)
 		ctx = _UNVERIFIED_SSL if self.scheme == 'https' else None
+		sent = ('<{} bytes>'.format(len(data)) if raw is not None else data.decode('utf-8')[:200]) if data else ''
 		sent_at = time.time()
 		try:
 			with urllib.request.urlopen(req, timeout=timeout or self.timeout, context=ctx) as resp:
@@ -106,13 +108,13 @@ class CameraClient:
 				detail = e.read().decode('utf-8', 'replace')[:200]
 			except Exception:
 				pass
-			self._observe(sent_at, method, path, e.code, detail or str(e.reason))
+			self._observe(sent_at, method, path, e.code, detail or str(e.reason), sent)
 			raise ApiError(e.code, detail or e.reason)
 		except (urllib.error.URLError, OSError) as e:
 			err = str(getattr(e, 'reason', e))
-			self._observe(sent_at, method, path, 0, err)
+			self._observe(sent_at, method, path, 0, err, sent)
 			raise ApiError(0, err)
-		self._observe(sent_at, method, path, status, '')
+		self._observe(sent_at, method, path, status, '', sent)
 		if binary:
 			return raw
 		if not raw:
@@ -122,11 +124,11 @@ class CameraClient:
 		except ValueError:
 			return None
 
-	def _observe(self, sent_at, method, path, status, error):
+	def _observe(self, sent_at, method, path, status, error, sent):
 		if request_observer is None:
 			return
 		try:
-			request_observer(sent_at, self.host, self.port, method, path, status, time.time() - sent_at, error)
+			request_observer(sent_at, self.host, self.port, method, path, status, time.time() - sent_at, error, sent)
 		except Exception:
 			pass
 

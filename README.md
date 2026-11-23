@@ -79,22 +79,38 @@ lucam-remote --open
 
 Or double-click **LUCam iPhone Remote.command**. The panel is at
 http://localhost:9980. Options: `--port 9980`, `--config path/to/cameras.json`,
-`--log-dir path/to/logs`. Quit with Ctrl-C or by closing the Terminal window.
+`--log` (see below). Quit with Ctrl-C or by closing the Terminal window.
 Quitting stops the live view and restores any camera that is in live mode.
 
 ### Log files
 
-Each run writes two files to `logs/` (next to `server.py`, or `--log-dir`):
+Off by default: the panel only keeps its last 50 log lines in memory. Start
+with `lucam-remote --log` to write two files per run to `logs/` (next to
+`server.py`, or `--log-dir path/to/logs`):
 
 - `lucam-YYYYMMDD-HHMMSS.log`: what the panel's log shows (cameras found, values
-  changed or restored, errors), plus every value written to a camera and every
-  request that failed, with the time to the millisecond.
-- `lucam-YYYYMMDD-HHMMSS.requests.csv`: every request sent to every camera, with
-  the time it was sent, how long the camera took to answer and the status. Laid
-  over a clip's timecode this tells what the app asked a phone at any moment. At
-  16 cameras it grows by about 25 MB an hour; `--no-request-log` skips it.
+  changed or restored, errors), plus every write sent to a camera with the
+  value it carried (`PUT /video/iso {"iso": 800} -> 204`) and failed requests,
+  with the time to the millisecond. A camera that stops answering gets one line
+  when it stops and one when it answers again, not one per attempt.
+- `lucam-YYYYMMDD-HHMMSS.requests.csv`: every request sent to every camera: when
+  it was sent, the camera, the path, what a write carried, the status and how
+  long the camera took to answer.
 
-`--no-log` keeps the log in memory only, as before.
+The controller sends each camera about 11 requests a second (20 while its focus
+is locked), so the requests file grows by about 2.5 MB an hour per camera: some
+40 MB an hour, or 400 MB over a 10-hour day, with 16 cameras.
+`--no-request-log` writes only the events file. Log files older than 30 days are
+deleted when the controller starts (`--log-keep-days 7` to change it, `0` to keep
+everything).
+
+**Times are this Mac's clock, not the phones' timecode.** To line a request up
+with a moment in a clip, you need the offset between the two: the phones set
+their timecode from their own clock (or a sync source), which can be a second
+or more away from the Mac's. A reliable way is a reference event in both: for
+example the REC press, logged as `POST /transports/0/record -> 204` in the
+events file, against the clip's first frame. Keep the Mac's clock synced
+too (System Settings > General > Date & Time > Set time automatically).
 
 ## 4. Using the UI
 
