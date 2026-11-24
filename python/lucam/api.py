@@ -7,6 +7,7 @@ since version 3.4. Only the standard library is used.
 
 import json
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +23,17 @@ _UNVERIFIED_SSL.verify_mode = ssl.CERT_NONE
 # status is 0 when the camera did not answer; error is '' on success. Set by the manager
 # to write the request log; must not raise.
 request_observer = None
+
+# One request at a time per camera. The app serves one request per connection and
+# closes it, so requests in parallel only add TLS handshakes; and a camera whose
+# answers have slowed must never have several waiting on it.
+_locks = {}
+_locks_guard = threading.Lock()
+
+
+def _lock_for(host, port):
+	with _locks_guard:
+		return _locks.setdefault((host, port), threading.Lock())
 
 
 class ApiError(Exception):
@@ -67,6 +79,8 @@ class CameraClient:
 	def __init__(self, address, timeout=2.0):
 		self.scheme, self.host, self.port = parse_address(address)
 		self.timeout = timeout
+		self.on_request = None   # called as (method, path, status, seconds) after every request
+		self._lock = _lock_for(self.host, self.port)
 
 	@property
 	def address(self):
@@ -93,26 +107,27 @@ class CameraClient:
 			headers['Content-Type'] = 'application/json'
 		req = urllib.request.Request(self.base_url + path, data=data, method=method, headers=headers)
 		ctx = _UNVERIFIED_SSL if self.scheme == 'https' else None
-		sent_at = time.time()
-		try:
-			with urllib.request.urlopen(req, timeout=timeout or self.timeout, context=ctx) as resp:
-				raw = resp.read()
-				status = resp.status
-				if headers_out is not None:
-					headers_out.update(resp.headers.items())
-		except urllib.error.HTTPError as e:
-			detail = ''
+		with self._lock:
+			sent_at = time.time()
 			try:
-				detail = e.read().decode('utf-8', 'replace')[:200]
-			except Exception:
-				pass
-			self._observe(sent_at, method, path, e.code, detail or str(e.reason))
-			raise ApiError(e.code, detail or e.reason)
-		except (urllib.error.URLError, OSError) as e:
-			err = str(getattr(e, 'reason', e))
-			self._observe(sent_at, method, path, 0, err)
-			raise ApiError(0, err)
-		self._observe(sent_at, method, path, status, '')
+				with urllib.request.urlopen(req, timeout=timeout or self.timeout, context=ctx) as resp:
+					raw = resp.read()
+					status = resp.status
+					if headers_out is not None:
+						headers_out.update(resp.headers.items())
+			except urllib.error.HTTPError as e:
+				detail = ''
+				try:
+					detail = e.read().decode('utf-8', 'replace')[:200]
+				except Exception:
+					pass
+				self._observe(sent_at, method, path, e.code, detail or str(e.reason))
+				raise ApiError(e.code, detail or e.reason)
+			except (urllib.error.URLError, OSError) as e:
+				err = str(getattr(e, 'reason', e))
+				self._observe(sent_at, method, path, 0, err)
+				raise ApiError(0, err)
+			self._observe(sent_at, method, path, status, '')
 		if binary:
 			return raw
 		if not raw:
@@ -123,12 +138,15 @@ class CameraClient:
 			return None
 
 	def _observe(self, sent_at, method, path, status, error):
-		if request_observer is None:
-			return
-		try:
-			request_observer(sent_at, self.host, self.port, method, path, status, time.time() - sent_at, error)
-		except Exception:
-			pass
+		took = time.time() - sent_at
+		for fn, args in ((self.on_request, (method, path, status, took)),
+						 (request_observer, (sent_at, self.host, self.port, method, path, status, took, error))):
+			if fn is None:
+				continue
+			try:
+				fn(*args)
+			except Exception:
+				pass
 
 	def get(self, path, timeout=None):
 		return self.request('GET', path, timeout=timeout)

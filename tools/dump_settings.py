@@ -27,7 +27,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
-from lucam import api  # noqa: E402
+from lucam import api, events  # noqa: E402
 
 
 def cameras_from_config(path):
@@ -63,6 +63,14 @@ def dump(name, address, out, keep):
 	folder = os.path.join(out, safe(name))
 	os.makedirs(folder, exist_ok=True)
 	report = {'name': name, 'address': address, 'presets': [], 'snapshot': None, 'error': None}
+	# The phone's event channel is held open for the duration: the app must not be
+	# sent requests while nothing listens to it (see python/lucam/events.py).
+	with events.listening(address) as report['listening']:
+		_dump(client, folder, report, keep)
+	return report
+
+
+def _dump(client, folder, report, keep):
 	try:
 		existing = client.presets()
 		for p in existing:
@@ -89,7 +97,6 @@ def dump(name, address, out, keep):
 					pass
 	except (api.ApiError, OSError, ValueError) as e:
 		report['error'] = str(e)
-	return report
 
 
 def main():
@@ -119,7 +126,8 @@ def main():
 		if r['error']:
 			print('FAILED: ' + r['error'])
 		else:
-			print('snapshot ok, {} preset(s) on the phone'.format(len(r['presets'])))
+			print('snapshot ok, {} preset(s) on the phone{}'.format(
+				len(r['presets']), '' if r['listening'] else ' (no event channel on this camera)'))
 
 	good = [r for r in reports if r.get('settings')]
 	flat = {r['name']: flatten(r['settings']) for r in good}

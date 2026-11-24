@@ -9,7 +9,9 @@ Two files per run, in the log folder:
                                       sent, how long the camera took to answer, and the status
 
 The requests file is for forensics: laid over a clip's timeline it shows what the app asked a
-phone at any moment. At 16 cameras polled twice a second it grows by about 25 MB an hour.
+phone at any moment, and how the phone's answers were timed through the day. Cameras are no
+longer polled, so it stays small: a line per command, plus one timing read per idle camera
+every 30 s.
 Writing is thread-safe; nothing here can raise into the caller (a full disk only stops the log).
 """
 

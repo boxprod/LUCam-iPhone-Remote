@@ -1,10 +1,13 @@
 """Camera fleet manager: one worker thread per camera, global commands,
 discovery, persistence, and the JSON HTTP API the web UI talks to.
 
+Cameras are listened to, not polled: see CameraWorker.
+
 Nothing here blocks the caller: every network call runs on a worker thread,
 so HTTP request handlers only ever read snapshots and queue commands.
 """
 
+import collections
 import json
 import math
 import os
@@ -17,7 +20,7 @@ import time
 import urllib.parse
 import uuid
 
-from . import api, discovery, filelog, livestream
+from . import api, discovery, events, filelog, livestream
 
 PARAMS = ('lens', 'iso', 'fps', 'shutter', 'wb', 'tint', 'letter', 'reel', 'codec', 'resolution', 'colorspace',
 		  'focus', 'autofocus', 'focusonce', 'focuslock', 'displaylut', 'cleanfeed', 'iris')
@@ -174,12 +177,75 @@ def format_shutter(info):
 
 
 class CameraWorker(threading.Thread):
-	LOST_WHILE_RECORDING = 10  # s offline while recording before the alarm
+	"""One camera: its event channel, its state, and every request sent to it.
+
+	How it talks to a camera, and why. Blackmagic Camera for iOS 3.5 slows down
+	over hours when its REST API is used while no client is connected to its
+	event WebSocket, until recordings drop frames; only relaunching the app
+	clears it. So:
+
+	- The event channel is opened before anything is sent, and kept open. The
+	  camera's state comes from its events. Nothing is read on a timer.
+	- State is read once when the channel opens, then only on demand: after a
+	  command, when a row is expanded, when a format change makes the lists of
+	  supported values stale.
+	- While the channel is down the worker sends nothing of its own accord.
+	- While a camera records the worker sends nothing of its own accord either:
+	  REC and STOP are the only requests a take needs.
+	- An unarmed camera is listened to and sent nothing of the worker's accord.
+	- One request at a time per camera (api.CameraClient holds the lock).
+	- Every answer is timed. A camera whose answers slow down is flagged, since
+	  the API reports neither dropped frames nor load.
+	- The API reports no trouble by itself, so the worker raises the alarms: a
+	  recording that stops unasked, a recording camera that goes away, a REC
+	  or STOP the camera acknowledged but did not carry out.
+	"""
+
+	LOST_WHILE_RECORDING = 10  # s without the camera while it records before the alarm
 	REC_GRACE = 3.0            # s after REC during which 'not recording' is not an alarm
-	POLL_FAST = 0.5      # record state / timecode
-	POLL_FOCUS_LOCKED = 0.2   # while focus is locked: undo a tap to focus quickly
-	POLL_FULL = 3.0      # all settings
-	RETRY_OFFLINE = 2.0
+	REC_CONFIRM = 3.0          # s to wait for the camera to confirm a REC or STOP by an event
+	TICK = 1.0                 # housekeeping interval; a tick sends nothing by itself
+	OFFLINE_AFTER = 3.0        # s without the event channel before the camera shows as offline
+	PING_AFTER = 5.0           # s of silence on the event channel before a ping
+	SILENT_AFTER = 10.0        # s of silence before the connection is taken for dead
+	# The one read on a timer: a single small GET to time the app's answer, only for an
+	# armed, idle camera whose event channel is open (0.3 status line per request there,
+	# against about 105 without a listener).
+	HEALTH_INTERVAL = 30.0
+	HEALTH_WINDOW = 5          # answers the median is taken over
+	FRESH_MAX = 0.160          # s: a fresh app answers within this from a client on the same network
+	WARN_DELAY = 0.100         # s above the camera's own baseline: warn
+	CRITICAL_DELAY = 0.250     # s above it: relaunch the app before the next take
+	BACK_OFF = 5.0             # s without requests of the worker's own after one went unanswered
+	WB_RESTORE_EVERY = 3.0     # s between two restores of a held white balance
+	FOCUS_RESTORE_EVERY = 0.3  # s between two restores of a locked focus
+	LIVE_CHECK_EVERY = 10.0    # s between checks of a live stream that reports no video
+	HOLD_DURING_TAKE = False   # True: a held WB or locked focus is also restored while recording
+
+	# What is read when the event channel opens: (key marking it unsupported, path).
+	CAPABILITY_PATHS = (
+		('product', '/system/product'), ('iso', '/video/supportedISOs'), ('shutter', '/video/supportedShutters'),
+		('wb', '/video/whiteBalance/description'), ('tint', '/video/whiteBalanceTint/description'),
+		('fps', '/system/supportedFormats'), ('colorspace', '/system/supportedDynamicRanges'),
+		('iris', '/lens/iris/description'), ('focus', '/lens/focus/description'),
+		('lenscams', '/lens/cameras'), ('lens', '/lens/zoom/description'),
+	)
+	VALUE_PATHS = (
+		('timecode', '/transports/0/timecode'), ('focus', '/lens/focus'), ('iso', '/video/iso'),
+		('shutter', '/video/shutter'), ('wb', '/video/whiteBalance'), ('tint', '/video/whiteBalanceTint'),
+		('fps', '/system/format'), ('colorspace', '/system/dynamicRange'), ('autofocus', '/lens/focus/autoFocus'),
+		('iris', '/lens/iris'), ('lens', '/lens/zoom'), ('lenscams', '/lens/cameras/active'),
+		('slate', '/slates/nextClip'), ('stream', '/livestreams/0'), ('stream', '/livestreams/0/activePlatform'),
+	)
+	PATH_KEYS = dict((p, k) for k, p in CAPABILITY_PATHS + VALUE_PATHS + (('record', '/transports/0/record'),))
+	# Read back after a command (the event channel does not carry every value, and a
+	# camera without one has no other way to confirm).
+	READ_BACK = {
+		'iso': ('/video/iso',), 'shutter': ('/video/shutter',), 'iris': ('/lens/iris',),
+		'lens': ('/lens/zoom', '/lens/cameras/active'), 'letter': ('/slates/nextClip',), 'reel': ('/slates/nextClip',),
+		'colorspace': ('/system/dynamicRange',), 'autofocus': ('/lens/focus/autoFocus',),
+		'focusonce': ('/lens/focus/autoFocus',),
+	}
 
 	def __init__(self, manager, cam_id, address, name='', active=True, live_mode=False, saved_format=None,
 				 focus_locked=False, wb_hold=None, focus_hold=None):
@@ -199,11 +265,15 @@ class CameraWorker(threading.Thread):
 		# Auto WB or applying a preset releases it. Saved in cameras.json.
 		self.wb_hold = {k: v for k, v in (wb_hold or {}).items() if k in ('wb', 'tint') and v is not None}
 		self._wb_restores = 0
+		self._wb_last_restore = 0.0
 		self._focus_target = None   # latest slider value; older ones are dropped
 		self.saved_format = saved_format if self.live_mode else None
 		self._format_lock = threading.Lock()
 		self._supported = []
 		self._lenses = []
+		self._zoom_desc = {}
+		self._front_lens = None     # name of the active lens when it is a front one
+		self._platform = {}         # the camera's active streaming platform
 		self._monitor_displays = {p: [] for p in MONITOR_SWITCHES}   # displays that have each switch
 		self._iris_controllable = False
 		self._iris_range = (None, None)
@@ -214,18 +284,39 @@ class CameraWorker(threading.Thread):
 		self.typed_address = address
 		self.candidates = api.address_candidates(address)
 		self.resolved = len(self.candidates) == 1
-		self.client = api.CameraClient(self.candidates[0])
+		self.client = self._make_client(self.candidates[0])
 		self.commands = queue.Queue()
 		self._halt = threading.Event()
-		self._next_fast = 0.0
-		self._next_full = 0.0
+		self.channel = None
+		self._listening = False        # the event channel is open
+		self._timecode_events = False  # this connection has delivered timecode events
+		self._legacy = False           # this camera has no event channel
+		self._connected = False        # its state has been read since it came online
+		self._channel_down_since = None
 		self._caps_dirty = True
-		self._rec_started = 0.0   # when the current recording began (ours or started on the phone)
-		self._offline_since = 0.0
+		self._resync_due = False       # values to re-read once that is allowed again
+		self._auto_after = 0.0         # no request of the worker's own before this (monotonic)
+		self._next_health = 0.0
+		self._last_ping = 0.0
+		self._timings = collections.deque(maxlen=self.HEALTH_WINDOW)
+		self._baseline = None
+		self._requests = 0
+		self._hold_check = set()       # holds to compare with the camera at the next tick
+		self._hold_after = {'wb': 0.0, 'focus': 0.0}
+		self._reread_at = {}           # path -> when it was last re-read after an event we could not use
+		self._was = {'recording': False, 'active': bool(active)}
+		self._rec_started = 0.0        # when the current recording began (ours or started on the phone)
+		self._rec_expected = None      # True/False while a REC/STOP of ours waits for the camera's event
+		self._rec_reported = None      # what the camera last said
+		self._rec_confirm = threading.Event()
+		self._expect_stop_until = 0.0
+		self._lost_alarmed = False
 		self.unsupported = set()
 		self._shutter_options = {}
 		self._angle_scale = 1
 		self._zero_bitrate_since = None
+		self._stream_format = None
+		self._live_checked = 0.0
 		self.state = {
 			'id': cam_id,
 			'name': name,
@@ -244,6 +335,13 @@ class CameraWorker(threading.Thread):
 			# dropped frames with "stop recording" on, full media, or a stop on the phone);
 			# cleared by the next REC. {'t', 'after', 'timecode'}
 			'stopAlert': None,
+			# The event channel: 'connecting', 'listening', 'lost' (was open, being reopened),
+			# 'none' (this camera has none: its state is not live).
+			'events': 'connecting', 'listenSince': 0, 'gaps': 0, 'gapSeconds': 0,
+			# How long the camera takes to answer a small read, median of the last few (ms),
+			# against the fastest it has been since connecting. 'health': 'ok', 'warn', 'critical'.
+			'answerMs': None, 'baselineMs': None, 'delayMs': None, 'health': None, 'answerTime': 0,
+			'requests': 0,
 			'timecode': None,
 			'streaming': None, 'streamBitrate': 0, 'liveOurs': False, 'livePath': None, 'liveWarning': None,
 			'lens': None, 'lensOptions': [], 'lensRange': None, 'lensNative': False, 'lensMain': None,
@@ -278,12 +376,15 @@ class CameraWorker(threading.Thread):
 		with self.manager.lock:
 			self.state.update(kw)
 
+	def _label(self):
+		return self.state['name'] or self.state['address']
+
 	def _error(self, msg):
 		self._update(error=msg, errorTime=time.time())
-		self.manager._log('{}: {}'.format(self.state['name'] or self.state['address'], msg))
+		self.manager._log('{}: {}'.format(self._label(), msg))
 
 	def _camera_stopped(self, tc):
-		"""The poll found the camera not recording when LUCam believed it was, and no STOP
+		"""The camera reports it is not recording when LUCam believed it was, and no STOP
 		was sent: the camera (or someone at the phone) ended the clip. With the app's
 		dropped-frames option on "stop recording" this is the live dropped-frame alarm."""
 		now = time.time()
@@ -295,18 +396,23 @@ class CameraWorker(threading.Thread):
 				  ' after {:.0f}s'.format(after) if after is not None else '',
 				  ' at tc {}'.format(tc) if tc else '')
 		self._error(msg)
-		self.manager.alert('{}: {}'.format(self.state['name'] or self.state['address'], msg))
+		self.manager.alert('{}: {}'.format(self._label(), msg))
 
 	def stop(self):
 		self._halt.set()
 		self.commands.put(None)
+		if self.channel:
+			self.channel.stop()
 
 	# --- main loop ------------------------------------------------------------
 
 	def run(self):
+		self._start_channel()
 		while not self._halt.is_set():
-			now = time.monotonic()
-			wait = max(0.0, min(self._next_fast, self._next_full) - now)
+			wait = self.TICK
+			if self._hold_check:   # a restore is owed: wake when it may be sent
+				due = min(self._hold_after[k] for k in self._hold_check) - time.monotonic()
+				wait = max(0.02, min(wait, due))
 			try:
 				cmd = self.commands.get(timeout=wait)
 			except queue.Empty:
@@ -315,9 +421,157 @@ class CameraWorker(threading.Thread):
 				break
 			if cmd:
 				self._execute(*cmd)
-				if time.monotonic() < min(self._next_fast, self._next_full):
-					continue
-			self._poll()
+			try:
+				self._tick()
+			except api.ApiError as e:
+				self._unanswered('housekeeping', e)
+
+	def _make_client(self, address):
+		client = api.CameraClient(address)
+		client.on_request = self._timing
+		return client
+
+	def _start_channel(self):
+		"""Open the event channel. Nothing is sent to the camera before it is open."""
+		addresses = [self.state['address']] if self.resolved else self.candidates
+		self.channel = events.EventChannel(
+			addresses, on_event=self._on_event, on_open=self._on_open, on_close=self._on_close,
+			on_refused=lambda address: self.commands.put(('refused', address)),
+			name='lucam-events-' + self.state['id'])
+		self.channel.start()
+
+	# Called on the event channel's thread.
+
+	def _on_open(self, address):
+		down, self._channel_down_since = self._channel_down_since, None
+		self._timecode_events = False
+		self._listening = True
+		self.commands.put(('open', address, None if down is None else time.monotonic() - down))
+
+	def _on_close(self, reason):
+		self._listening = False
+		self._channel_down_since = time.monotonic()
+		self.commands.put(('closed', reason))
+
+	def _on_event(self, prop, value):
+		# Tally and timecode are applied at once; the rest goes through the worker's
+		# queue, in order with its own requests.
+		if isinstance(value, dict):
+			if prop == '/transports/0/timecode' and value.get('display') is not None:
+				self._timecode_events = True
+				self._update(timecode=value['display'], lastSeen=time.time())
+				return
+			if prop == '/transports/0/record' and 'recording' in value:
+				self._on_record(bool(value['recording']))
+				return
+		self.commands.put(('event', prop, value))
+
+	# --- connection -------------------------------------------------------------
+
+	def _opened(self, address, gap=None):
+		"""The event channel is open: read the camera's state under it."""
+		if address != self.client.address or not self.resolved:
+			self.client = self._make_client(address)
+			self.resolved = True
+			self._update(address=self.client.address)
+			self.manager._save_later()
+		self._legacy = False
+		self._lost_alarmed = False
+		upd = {'events': 'listening', 'listenSince': time.time()}
+		if gap is not None:
+			upd.update(gaps=self.state['gaps'] + 1, gapSeconds=round(self.state['gapSeconds'] + gap, 1))
+			self.manager._log('{}: event channel back after {:.1f} s'.format(self._label(), gap))
+		first = not self._connected
+		self._update(online=True, connecting=False, lastSeen=time.time(), **upd)
+		self._auto_after = 0.0
+		self._resync_due = True
+		if first:
+			self.manager._log('{}: event channel open'.format(self._label()))
+		if not self._listening:
+			return   # it dropped again already: the next opening does the reading
+		try:
+			# Whether it records comes first: a recording camera is sent nothing else.
+			self._read('record', '/transports/0/record')
+			if self.state['recording']:
+				if first:
+					self.manager._log('{}: it is recording; its settings are read when the take ends'.format(self._label()))
+				return
+			self._resync(first=first)
+		except api.ApiError as e:
+			self._unanswered('reading the camera', e)   # tried again from the tick
+
+	def _closed(self, reason):
+		if self._connected and not self._legacy:
+			self._update(events='lost')
+			self.manager._log('{}: event channel lost ({}); reconnecting'.format(self._label(), reason))
+
+	def _refused(self, address):
+		"""A server answers at this address without an event channel (not the iPhone app
+		at 3.5: another Blackmagic camera, older firmware). Its state can only be read
+		once and after each command: polling it is what this controller no longer does."""
+		if self._legacy and self.state['online']:
+			return
+		if api.probe(address, timeout=1.5) is None:
+			return
+		if address != self.client.address or not self.resolved:
+			self.client = self._make_client(address)
+			self.resolved = True
+			self._update(address=self.client.address)
+			self.manager._save_later()
+		self._legacy = True
+		self._update(events='none')
+		self._read_all()
+		self._update(online=True, connecting=False, lastSeen=time.time())
+		self.manager._log('{}: connected. This camera has no event channel: its state is read once and after '
+						  'each command, and is not live (↻ reads it again)'.format(self._label()))
+
+	def _resync(self, first=False, light=False):
+		"""Read the camera's state once. Deferred while that is not allowed (it records,
+		or it is unarmed and already known)."""
+		if self._legacy:
+			self._read_all() if not light else self._read_unbroadcast()
+			return
+		if not self._may_send(armed=not first and not light):
+			self._resync_due = self._resync_due or not light
+			return
+		if light:
+			self._read_unbroadcast()
+			return
+		self._resync_due = False
+		try:
+			if first or self._caps_dirty or not self._connected:
+				self._read_all()
+				self._subscribe_all()
+				if first:
+					self.manager._log('{}: connected, listening to its events'.format(self._label()))
+			else:
+				self._read_values()
+		except api.ApiError:
+			self._resync_due = True
+			raise
+
+	def _read_all(self):
+		self._load_capabilities()
+		self._read_values(monitors=False)
+		self._connected = True
+
+	def _subscribe_all(self):
+		"""Subscribe to everything the camera can report, as in the long tests."""
+		listing = self._try('eventlist', self.client.get, '/event/list')
+		props = listing.get('events') if isinstance(listing, dict) else listing
+		if isinstance(props, list):
+			self.channel.subscribe([p for p in props if isinstance(p, str)])
+
+	def _may_send(self, armed=True, during_take=False):
+		"""Whether the worker may send this camera a request of its own accord."""
+		s = self.state
+		return bool(self._listening and s['online'] and (during_take or not (s['recording'] or s['recordPending']))
+					and (s['active'] or not armed) and time.monotonic() >= self._auto_after)
+
+	def _unanswered(self, what, e):
+		"""A request of the worker's own went unanswered: say so and hold off."""
+		self._auto_after = time.monotonic() + self.BACK_OFF
+		self._error('{}: no answer from the camera ({})'.format(what, e))
 
 	def _try(self, key, fn, *args):
 		"""Run one GET; returns None when the endpoint is unsupported.
@@ -333,54 +587,383 @@ class CameraWorker(threading.Thread):
 				self.unsupported.add(key)
 			return None
 
-	def _poll(self):
+	def _read(self, key, path):
+		"""GET one path and fold the answer into the state."""
+		value = self._try(key, self.client.get, path)
+		if value is not None:
+			self._apply(path, value)
+		return value
+
+	# --- housekeeping -------------------------------------------------------------
+
+	def _tick(self):
 		now = time.monotonic()
-		c = self.client
-		try:
-			if self._caps_dirty or not self.state['online']:
-				self._load_capabilities()
-			rec = self._try('record', c.is_recording)
-			if not self.resolved:
-				self.resolved = True
-				self.manager._save_later()
-			upd = {'online': True, 'connecting': False, 'lastSeen': time.time()}
-			tc = self._try('timecode', c.timecode)
-			if tc is not None:
-				upd['timecode'] = tc
-			if rec is not None and not self.state['recordPending']:
-				if rec and not self.state['recording']:
-					self._rec_started = time.time()       # started on the phone
-				elif self.state['recording'] and not rec and time.time() - self._rec_started < self.REC_GRACE:
-					rec = None  # the camera is still opening its file (1.2 s on an SSD); keep 'recording'
-				elif self.state['recording'] and not rec:
-					self._camera_stopped(tc)
-				if rec is not None:
-					upd['recording'] = rec
-			fo = self._try('focus', c.focus)
-			if fo is not None:
-				upd['focus'] = self._hold_focus(fo)
-			self._update(**upd)
-			if now >= self._next_full:
-				self._poll_settings()
-				self._next_full = now + self.POLL_FULL
-			self._next_fast = now + (self.POLL_FOCUS_LOCKED if self.focus_locked else self.POLL_FAST)
-		except api.ApiError as e:
-			if not self.resolved and self._try_other_addresses():
-				self._next_fast = self._next_full = 0
-				return
-			if self.state['online'] or self.state['connecting']:
-				self._error('offline ({})'.format(e))
-				self._offline_since = time.time()
-			elif self.state['recording'] and not self.state['stopAlert'] and self._offline_since \
-					and time.time() - self._offline_since > self.LOST_WHILE_RECORDING:
+		s = self.state
+		down = self._channel_down_since
+		if down is not None and not self._legacy:
+			if s['online'] and now - down > self.OFFLINE_AFTER:
+				self._error('offline (event channel lost)')
+				self._update(online=False, connecting=False)
+				self._connected = False
+				self._caps_dirty = True
+			if s['recording'] and not s['stopAlert'] and not self._lost_alarmed and now - down > self.LOST_WHILE_RECORDING:
 				# a recording camera that stays unreachable: the app died or was left
-				self._update(stopAlert={'t': time.time(), 'after': None, 'timecode': self.state.get('timecode'), 'kind': 'lost'})
+				self._lost_alarmed = True
+				self._update(stopAlert={'t': time.time(), 'after': None, 'timecode': s.get('timecode'), 'kind': 'lost'})
 				self.manager.alert('{}: RECORDING CAMERA LOST for {:.0f}s (app not answering: crashed, closed or '
-								   'phone locked?) last tc {}'.format(self.state['name'] or self.state['address'],
-								   time.time() - self._offline_since, self.state.get('timecode')))
-			self._update(online=False, connecting=False)
+								   'phone locked?) last tc {}'.format(self._label(), now - down, s.get('timecode')))
+			return
+		if not s['online']:
+			return
+		if self._listening:
+			quiet = now - self.channel.last_rx
+			if quiet > self.PING_AFTER and now - self._last_ping > self.PING_AFTER:
+				self._last_ping = now
+				self.channel.ping()
+			# Silence where there must be traffic: pings it used to answer, or the
+			# timecode of a recording. Reopen (the camera is reported lost if that fails).
+			if quiet > self.SILENT_AFTER and (self.channel.pongs or s['recording'] and self._timecode_events):
+				self.channel.reset()
+				return
+		# what the camera last said about recording, once the grace after REC is over
+		if s['recording'] and self._rec_reported is False and self._rec_expected is None \
+				and time.time() - self._rec_started >= self.REC_GRACE:
+			self._on_record(False)
+		# transitions that make deferred work due
+		if self._was['recording'] and not s['recording'] or s['active'] and not self._was['active']:
+			self._hold_check.update(k for k in ('wb', 'focus') if self._holding(k))
+			self._next_health = min(self._next_health, now + 2)
+		self._was = {'recording': s['recording'], 'active': s['active']}
+		if self._resync_due and self._may_send(armed=self._connected):
+			self._resync(first=not self._connected)
+		elif self._caps_dirty and self._connected and self._may_send():
+			self._load_capabilities()
+		self._enforce_holds(now)
+		if now >= self._next_health and self._may_send():
+			self._next_health = now + self.HEALTH_INTERVAL
+			try:
+				self._read('record', '/transports/0/record')
+			except api.ApiError as e:
+				self._unanswered('health check', e)
+				if now - self.channel.last_rx > self.SILENT_AFTER:
+					self.channel.reset()   # neither events nor answers: reopen
+		self._check_live(now)
+
+	def _timing(self, method, path, status, took):
+		"""Called after every request to this camera. Small reads are comparable with
+		each other: their median, against the fastest it has been, is the app's delay."""
+		self._requests += 1
+		if method != 'GET' or path.startswith(('/presets', '/livestreams/platforms', '/event')):
+			self._update(requests=self._requests)
+			return
+		if status == 0 and took < 0.9 * self.client.timeout:
+			self._update(requests=self._requests)
+			return   # refused or reset at once: says nothing about the app's delay
+		self._timings.append(took)
+		upd = {'requests': self._requests}
+		if len(self._timings) >= 3:
+			median = sorted(self._timings)[len(self._timings) // 2]
+			self._baseline = min(median, self._baseline if self._baseline is not None else median, self.FRESH_MAX)
+			delay = median - self._baseline
+			health = 'critical' if delay >= self.CRITICAL_DELAY else 'warn' if delay >= self.WARN_DELAY else 'ok'
+			was = self.state['health']
+			upd.update(answerMs=round(median * 1000), baselineMs=round(self._baseline * 1000),
+					   delayMs=round(delay * 1000), health=health, answerTime=time.time())
+			self._update(**upd)
+			if health != was and health == 'critical':
+				self.manager.alert('{}: APP SLOW - answers take {:.0f} ms, {:.0f} ms more than a fresh app. Recordings '
+								   'may drop frames: quit and relaunch Blackmagic Camera on this phone before the '
+								   'next take'.format(self._label(), median * 1000, delay * 1000))
+			elif health != was and health == 'warn':
+				self.manager._log('{}: answers are slowing ({:.0f} ms, {:.0f} ms more than a fresh app)'.format(
+					self._label(), median * 1000, delay * 1000))
+			elif health == 'ok' and was in ('warn', 'critical'):
+				self.manager._log('{}: answers back to normal ({:.0f} ms)'.format(self._label(), median * 1000))
+			return
+		self._update(**upd)
+
+	# --- state: one property at a time, from a read or from an event ----------------
+
+	def _event(self, prop, value):
+		"""An event from the queue."""
+		m = re.match(r'^/monitoring/([^/]+)/(displayLUT|cleanFeed)$', prop)
+		if prop not in self.PATH_KEYS and not m:
+			return   # subscribed to, not used
+		try:
+			if not isinstance(value, dict):
+				raise TypeError('not an object')
+			self._apply(prop, value)
+		except (KeyError, TypeError, ValueError, AttributeError):
+			# Not the object a GET returns: read the value instead, at most every 5 s.
+			now = time.monotonic()
+			if prop in self.PATH_KEYS and now - self._reread_at.get(prop, 0) > 5 and self._may_send():
+				self._reread_at[prop] = now
+				self._read(self.PATH_KEYS[prop], prop)
+
+	def _apply(self, path, v):
+		"""Fold one property's value into the state. `v` is what a GET of `path`
+		returns, which is also what its event carries."""
+		upd = {}
+		if path == '/transports/0/record':
+			self._on_record(bool(v.get('recording')))
+			return
+		elif path == '/transports/0/timecode':
+			if v.get('display') is not None:
+				upd['timecode'] = v['display']
+		elif path == '/system/product':
+			upd = {'product': v.get('productName', ''), 'deviceName': v.get('deviceName', ''),
+				   'software': v.get('softwareVersion', '')}
+			if not self.state['name'] and upd['deviceName']:
+				upd['name'] = upd['deviceName']
+				self.manager._save_later()
+		elif path == '/video/supportedISOs':
+			if v.get('supportedISOs'):
+				upd['isoOptions'] = v['supportedISOs']
+		elif path == '/video/supportedShutters':
+			self._shutter_options = v
+			upd['shutterOptions'] = self._shutter_option_labels(self.state['shutterMode'])
+		elif path in ('/video/whiteBalance/description', '/video/whiteBalanceTint/description'):
+			key = 'wb' if path == '/video/whiteBalance/description' else 'tint'
+			d = v.get('whiteBalance' if key == 'wb' else 'whiteBalanceTint') or {}
+			upd[key + 'Range'] = [d.get('min'), d.get('max')] if d else None
+		elif path == '/system/supportedFormats':
+			self._supported = v.get('supportedFormats', [])
+			upd['resolutionOptions'] = [{
+				'value': res_key(f.get('recordResolution')),
+				'label': '{} · {}×{}'.format((f.get('resolutionDescriptor') or {}).get('description') or '',
+											 f['recordResolution']['width'], f['recordResolution']['height']).strip(' ·'),
+			} for f in self._supported if f.get('recordResolution')]
+			upd.update(self._format_state())
+		elif path == '/system/supportedDynamicRanges':
+			upd['colorspaceOptions'] = v.get('supportedDynamicRanges', [])
+		elif path == '/lens/iris/description':
+			self._iris_controllable = bool(v.get('controllable'))
+			rng = v.get('apertureStop') or {}
+			lo, hi = rng.get('min'), rng.get('max')
+			self._iris_range = (lo, hi)
+			if self._iris_controllable and lo is not None and hi is not None:
+				stops = sorted({round(lo, 2), round(hi, 2)} | {f for f in F_STOPS if lo - 0.01 <= f <= hi + 0.01})
+				upd['irisOptions'] = [format_f_stop(f) for f in stops]
+			else:
+				upd['irisOptions'] = []
+			upd['irisControllable'] = self._iris_controllable
+		elif path == '/lens/focus/description':
+			upd['focusControllable'] = bool(v.get('controllable'))
+		elif path == '/lens/cameras':
+			self._lenses = [l for l in (v.get('cameras') or []) if l.get('isAvailable', True) and l.get('id')]
+			upd.update(self._lens_options())
+		elif path == '/lens/zoom/description':
+			self._zoom_desc = v
+			upd.update(self._lens_options())
+		elif path == '/lens/focus':
+			if v.get('normalised') is not None:
+				upd['focus'] = v['normalised']
+				if self.focus_locked:
+					if self.focus_hold is None:
+						self.focus_hold = v['normalised']
+						self.manager._save_later()
+					self._hold_check.add('focus')
+		elif path == '/video/iso':
+			if v.get('iso') is not None:
+				upd['iso'] = v['iso']
+		elif path == '/video/shutter':
+			upd['shutter'] = format_shutter(v)
+			mode = 'ShutterAngle' if v.get('shutterSpeed') is None and v.get('shutterAngle') is not None else 'ShutterSpeed'
+			upd['shutterMode'] = mode
+			if mode == 'ShutterAngle':
+				self._angle_scale = 100 if v['shutterAngle'] > 360 else 1
+			upd['shutterOptions'] = self._shutter_option_labels(mode)
+		elif path in ('/video/whiteBalance', '/video/whiteBalanceTint'):
+			key, field = ('wb', 'whiteBalance') if path == '/video/whiteBalance' else ('tint', 'whiteBalanceTint')
+			if v.get(field) is not None:
+				upd[key] = v[field]
+				if key in self.wb_hold:
+					self._hold_check.add('wb')
+		elif path == '/system/format':
+			if v:
+				old = self._device_format
+				if old and (v.get('frameRate') != old.get('frameRate')            # shutter/ISO lists can depend on frame rate
+							or v.get('recordResolution') != old.get('recordResolution')):   # turning the phone swaps its format list
+					self._caps_dirty = True
+				self._device_format = v
+				upd.update(self._format_state())
+		elif path == '/system/dynamicRange':
+			if v.get('dynamicRange') is not None:
+				self._device_dr = v['dynamicRange']
+				upd.update(self._format_state())
+		elif path == '/lens/focus/autoFocus':
+			if v:
+				upd['autofocusSupported'] = bool(v.get('supported', True))
+				upd['autofocus'] = 'Continuous' if v.get('enabled') and v.get('mode') == 'Continuous' else 'Off'
+		elif path == '/lens/iris':
+			if v.get('apertureStop') is not None:
+				upd['iris'] = format_f_stop(v['apertureStop'])
+				upd['irisAuto'] = bool(v.get('continuousApertureAutoExposure'))
+		elif path == '/lens/zoom':
+			if v:
+				upd['lens'] = self._front_lens or v.get('focalLength')
+		elif path == '/lens/cameras/active':
+			if v:
+				upd['lensId'] = v.get('id')
+				if v.get('facing') == 'front':
+					self._front_lens = lens_names(self._lenses).get(v.get('id'), 'Front')
+					upd['lens'] = self._front_lens
+				elif self._front_lens:
+					self._front_lens = None
+					if v.get('focalLength') is not None:
+						upd['lens'] = v['focalLength']
+		elif path == '/slates/nextClip':
+			if v:
+				upd['letter'] = (v.get('project') or {}).get('camera')
+				upd['reel'] = (v.get('clip') or {}).get('reel')
+				upd['clipName'] = (v.get('clip') or {}).get('clipName')
+		elif path == '/livestreams/0':
+			if v:
+				status, bitrate = v.get('status'), v.get('bitrate') or 0
+				upd['streaming'] = status
+				upd['streamBitrate'] = bitrate
+				if status in (None, 'Idle'):
+					upd['liveOurs'] = False
+				elif self._platform:
+					upd['liveOurs'] = self._platform.get('platform') == livestream.PLATFORM_ID
+				self._stream_format = v.get('effectiveVideoFormat')
+				upd['liveWarning'] = self._stream_warning(status, bitrate, self._stream_format)
+		elif path == '/livestreams/0/activePlatform':
+			self._platform = v
+			if self.state['streaming'] not in (None, 'Idle'):
+				upd['liveOurs'] = v.get('platform') == livestream.PLATFORM_ID
+		else:
+			m = re.match(r'^/monitoring/([^/]+)/(displayLUT|cleanFeed)$', path)
+			if m and 'enabled' in v:
+				display = urllib.parse.unquote(m.group(1))
+				for param, (feature, key) in MONITOR_SWITCHES.items():
+					if feature != m.group(2):
+						continue
+					known = self._monitor_displays[param]
+					if display == 'LCD' and 'LCD' not in known and 'Device' in known:
+						display = 'Device'   # the event list names the phone's screen LCD, the REST paths Device
+					if display in known:
+						upd[key] = dict(self.state.get(key) or {}, **{display: bool(v['enabled'])})
+		if upd:
+			self._update(lastSeen=time.time(), **upd)
+
+	def _on_record(self, rec):
+		"""The camera says it is, or is not, recording (an event, or a read)."""
+		stopped = False
+		with self.manager.lock:
+			s = self.state
+			prev, now = s['recording'], time.time()
+			self._rec_reported = rec
+			if self._rec_expected is not None and rec == self._rec_expected:
+				self._rec_confirm.set()
+			if rec and not prev:
+				if self._rec_expected is not True:
+					self._rec_started = now   # started on the phone
+				s['recording'] = True
+			elif prev and not rec:
+				if self._rec_expected is False or time.monotonic() < self._expect_stop_until:
+					s['recording'] = False    # the STOP we sent
+				elif now - self._rec_started < self.REC_GRACE:
+					pass   # the camera is still opening its file (1.2 s on an SSD); looked at again after the grace
+				else:
+					s['recording'] = False
+					stopped = True
+			s['lastSeen'] = now
+			tc = s.get('timecode')
+		if stopped:
+			self._camera_stopped(tc)
+
+	def _shutter_option_labels(self, mode):
+		opts = self._shutter_options or {}
+		if mode == 'ShutterAngle':
+			return [format_shutter({'shutterAngle': a}) for a in opts.get('shutterAngles', [])]
+		return ['1/{}'.format(s) for s in opts.get('shutterSpeeds', [])]
+
+	def _lens_options(self):
+		"""The Lens list: the phone's own lenses, else focal lengths within its zoom range."""
+		upd = {}
+		fl = (self._zoom_desc or {}).get('focalLength') or {}
+		if self._lenses:
+			# The phone's own lens list: switching selects the physical lens.
+			back = sorted((l for l in self._lenses if l.get('facing') != 'front'), key=lambda l: l.get('focalLength', 0))
+			front = [l for l in self._lenses if l.get('facing') == 'front']
+			names = lens_names(back + front)
+			upd['lensOptions'] = [{'value': l['id'], 'mm': l.get('focalLength'), 'zoom': (l.get('zoomFactor') or '').replace('x', '×'),
+								   'facing': l.get('facing', 'back'), 'label': names[l['id']]} for l in back + front]
+			upd['lensNative'] = True
+			upd['lensMain'] = next((l.get('focalLength') for l in back if l.get('zoomFactor') == '1x'), None)
+			if fl.get('min') is not None:
+				upd['lensRange'] = [fl['min'], fl.get('max')]
+		elif fl.get('min') is not None and fl.get('max') is not None:
+			lo, hi = fl['min'], fl['max']
+			upd['lensRange'] = [lo, hi]
+			native = NATIVE_LENSES_MM.get((self.state['product'] or '').strip())
+			if native:
+				opts = [mm for mm in native if lo <= mm <= hi]
+			else:
+				opts = sorted({lo, hi} | {mm for mm in LENS_PRESETS_MM if lo <= mm <= hi})
+			upd['lensOptions'] = opts
+			upd['lensNative'] = bool(native)
+			# 1x reference for the zoom factor shown next to each focal length
+			upd['lensMain'] = min(opts, key=lambda mm: abs(mm - 25)) if opts else None
+		return upd
+
+	def _load_capabilities(self):
+		"""What the camera can do: lists of supported values, ranges, lenses, displays."""
+		self._caps_dirty = False
+		try:
+			for key, path in self.CAPABILITY_PATHS:
+				self._read(key, path)
+			self._read_monitors(discover=True)
+		except api.ApiError:
 			self._caps_dirty = True
-			self._next_fast = self._next_full = now + self.RETRY_OFFLINE
+			raise
+
+	def _read_monitors(self, discover=False):
+		"""On/off switches per display. With `discover`, find which displays have each:
+		the listed ones plus HDMI (not listed). The phone screen has a LUT switch but no
+		clean feed; HDMI has both."""
+		c = self.client
+		names = list(dict.fromkeys((self._try('displaylut', c.displays) or []) + ['HDMI'])) if discover else None
+		upd = {}
+		for param, (feature, key) in MONITOR_SWITCHES.items():
+			values = {}
+			for name in (names if discover else self._monitor_displays[param]):
+				try:
+					values[name] = c.monitor_switch(name, feature)
+				except api.ApiError as e:
+					if e.status == 0:
+						raise
+			if discover:
+				self._monitor_displays[param] = list(values)
+			upd[key] = values
+		self._update(**upd)
+
+	def _read_values(self, monitors=True):
+		"""Every setting, once."""
+		for key, path in self.VALUE_PATHS:
+			if path == '/lens/cameras/active' and not self._lenses:
+				continue
+			self._read(key, path)
+		if monitors:
+			self._read_monitors()
+
+	def _read_unbroadcast(self):
+		"""The values the event channel does not carry (read when a row is expanded)."""
+		self._read('autofocus', '/lens/focus/autoFocus')
+		self._read_monitors()
+
+	def _check_live(self, now):
+		"""A live stream that reports no video: confirm by a read before warning, then
+		look again now and then (the event channel may not carry every bitrate change)."""
+		s = self.state
+		if not (s['liveOurs'] and s['streaming'] == 'Streaming' and not s['streamBitrate']):
+			return
+		if self._zero_bitrate_since is None or now - self._zero_bitrate_since < 8:
+			return
+		if now - self._live_checked >= self.LIVE_CHECK_EVERY and self._may_send(armed=False):
+			self._live_checked = now
+			self._read('stream', '/livestreams/0')
 
 	def _start_live(self):
 		"""Point the camera's live stream at our MediaMTX and start it."""
@@ -411,7 +994,7 @@ class CameraWorker(threading.Thread):
 			urls = [s.get('url') for s in c.platform(livestream.PLATFORM_ID).get('servers', [])]
 			if rtmp_url not in urls:
 				raise api.ApiError(0, 'the camera did not accept the live platform for {}'.format(rtmp_url))
-			self.manager._log('{}: live platform set to {}'.format(self.state['name'] or self.state['address'], rtmp_url))
+			self.manager._log('{}: live platform set to {}'.format(self._label(), rtmp_url))
 		status = (c.stream_status() or {}).get('status')
 		key = self.state['id']
 		plat = c.active_platform()
@@ -425,193 +1008,31 @@ class CameraWorker(threading.Thread):
 		if status in (None, 'Idle'):
 			c.stream(True)
 		self._zero_bitrate_since = None
+		self._platform = {'platform': livestream.PLATFORM_ID, 'key': key}
 		self._update(livePath='live/' + key, liveOurs=True, streaming='Connecting')
-		self.manager._log('{}: live view started'.format(self.state['name'] or self.state['address']))
+		self.manager._log('{}: live view started'.format(self._label()))
 
 	def _reconnect(self):
 		"""Drop everything learned about the camera and connect from scratch:
-		fresh client, re-resolve the address, re-read capabilities."""
+		new event channel, re-resolve the address, re-read everything."""
+		if self.channel:
+			self.channel.stop()
 		self.unsupported.clear()
 		self._shutter_options = {}
 		self._angle_scale = 1
 		self.resolved = len(self.candidates) == 1
-		self.client = api.CameraClient(self.candidates[0] if not self.resolved else self.state['address'])
+		self.client = self._make_client(self.candidates[0] if not self.resolved else self.state['address'])
+		self._listening = self._legacy = self._connected = False
+		self._channel_down_since = None
 		self._caps_dirty = True
-		self._update(connecting=True, online=False, error=None, errorTime=0, recordPending=False)
-		self.manager._log('{}: reconnecting'.format(self.state['name'] or self.state['address']))
-		self._next_fast = self._next_full = 0
-
-	def _try_other_addresses(self):
-		for candidate in self.candidates[1:]:
-			if api.probe(candidate, timeout=1.5) is not None:
-				self.client = api.CameraClient(candidate)
-				self.resolved = True
-				self._update(address=self.client.address)
-				self.manager._save_later()
-				return True
-		return False
-
-	def _load_capabilities(self):
-		c = self.client
-		info = self._try('product', c.product) or {}
-		upd = {
-			'product': info.get('productName', ''),
-			'deviceName': info.get('deviceName', ''),
-			'software': info.get('softwareVersion', ''),
-		}
-		if not self.state['name'] and upd['deviceName']:
-			upd['name'] = upd['deviceName']
-			self.manager._save_later()
-		isos = self._try('iso', c.supported_isos)
-		if isos:
-			upd['isoOptions'] = isos
-		shutters = self._try('shutter', c.supported_shutters) or {}
-		upd['wbRange'] = self._try('wb', c.white_balance_range)
-		upd['tintRange'] = self._try('tint', c.tint_range)
-		supported = self._try('fps', c.get, '/system/supportedFormats') or {}
-		self._supported = supported.get('supportedFormats', [])
-		upd['resolutionOptions'] = [{
-			'value': res_key(f.get('recordResolution')),
-			'label': '{} · {}×{}'.format((f.get('resolutionDescriptor') or {}).get('description') or '',
-										 f['recordResolution']['width'], f['recordResolution']['height']).strip(' ·'),
-		} for f in self._supported if f.get('recordResolution')]
-		upd['colorspaceOptions'] = self._try('colorspace', c.supported_dynamic_ranges) or []
-		# Displays with each switch: the listed ones plus HDMI (not listed). The
-		# phone screen has a LUT switch but no clean feed; HDMI has both.
-		names = list(dict.fromkeys((self._try('displaylut', c.displays) or []) + ['HDMI']))
-		for param, (feature, _) in MONITOR_SWITCHES.items():
-			self._monitor_displays[param] = []
-			for name in names:
-				try:
-					c.monitor_switch(name, feature)
-					self._monitor_displays[param].append(name)
-				except api.ApiError as e:
-					if e.status == 0:
-						raise
-		idesc = self._try('iris', c.iris_description) or {}
-		self._iris_controllable = bool(idesc.get('controllable'))
-		rng = idesc.get('apertureStop') or {}
-		lo, hi = rng.get('min'), rng.get('max')
-		self._iris_range = (lo, hi)
-		if self._iris_controllable and lo is not None and hi is not None:
-			stops = sorted({round(lo, 2), round(hi, 2)} | {f for f in F_STOPS if lo - 0.01 <= f <= hi + 0.01})
-			upd['irisOptions'] = [format_f_stop(f) for f in stops]
-		else:
-			upd['irisOptions'] = []
-		upd['irisControllable'] = self._iris_controllable
-		fd = self._try('focus', c.get, '/lens/focus/description') or {}
-		upd['focusControllable'] = bool(fd.get('controllable'))
-		lenses = self._try('lenscams', c.lens_cameras)
-		self._lenses = [l for l in (lenses or []) if l.get('isAvailable', True) and l.get('id')]
-		zd = self._try('lens', c.zoom_description) or {}
-		fl = zd.get('focalLength') or {}
-		if self._lenses:
-			# The phone's own lens list: switching selects the physical lens.
-			back = sorted((l for l in self._lenses if l.get('facing') != 'front'), key=lambda l: l.get('focalLength', 0))
-			front = [l for l in self._lenses if l.get('facing') == 'front']
-			names = lens_names(back + front)
-			upd['lensOptions'] = [{'value': l['id'], 'mm': l.get('focalLength'), 'zoom': (l.get('zoomFactor') or '').replace('x', '×'),
-								   'facing': l.get('facing', 'back'), 'label': names[l['id']]} for l in back + front]
-			upd['lensNative'] = True
-			upd['lensMain'] = next((l.get('focalLength') for l in back if l.get('zoomFactor') == '1x'), None)
-			if fl.get('min') is not None:
-				upd['lensRange'] = [fl['min'], fl.get('max')]
-		elif fl.get('min') is not None and fl.get('max') is not None:
-			lo, hi = fl['min'], fl['max']
-			upd['lensRange'] = [lo, hi]
-			native = NATIVE_LENSES_MM.get(upd['product'].strip())
-			if native:
-				opts = [mm for mm in native if lo <= mm <= hi]
-			else:
-				opts = sorted({lo, hi} | {mm for mm in LENS_PRESETS_MM if lo <= mm <= hi})
-			upd['lensOptions'] = opts
-			upd['lensNative'] = bool(native)
-			# 1x reference for the zoom factor shown next to each focal length
-			upd['lensMain'] = min(opts, key=lambda mm: abs(mm - 25)) if opts else None
-		self._update(**upd)
-		self._shutter_options = shutters
-		self._caps_dirty = False
-
-	def _poll_settings(self):
-		c = self.client
-		upd = {}
-		v = self._try('iso', c.iso)
-		if v is not None:
-			upd['iso'] = v
-		sh = self._try('shutter', c.shutter)
-		if sh:
-			upd['shutter'] = format_shutter(sh)
-			mode = 'ShutterAngle' if sh.get('shutterSpeed') is None and sh.get('shutterAngle') is not None else 'ShutterSpeed'
-			upd['shutterMode'] = mode
-			if mode == 'ShutterAngle':
-				self._angle_scale = 100 if sh['shutterAngle'] > 360 else 1
-			opts = self._shutter_options
-			if mode == 'ShutterAngle':
-				upd['shutterOptions'] = [format_shutter({'shutterAngle': a}) for a in opts.get('shutterAngles', [])]
-			else:
-				upd['shutterOptions'] = ['1/{}'.format(s) for s in opts.get('shutterSpeeds', [])]
-		v = self._try('wb', c.white_balance)
-		if v is not None:
-			upd['wb'] = v
-		v = self._try('tint', c.tint)
-		if v is not None:
-			upd['tint'] = v
-		self._restore_wb(upd)
-		fmt = self._try('fps', c.format)
-		if fmt:
-			fr = fmt.get('frameRate')
-			if self._device_format and fr != self._device_format.get('frameRate'):
-				self._caps_dirty = True  # shutter/ISO lists can depend on frame rate
-			if self._device_format and fmt.get('recordResolution') != self._device_format.get('recordResolution'):
-				self._caps_dirty = True  # turning the phone swaps its format list (vertical crops)
-			self._device_format = fmt
-			dr = self._try('colorspace', c.dynamic_range)
-			if dr is not None:
-				self._device_dr = dr
-			upd.update(self._format_state())
-		for param, (feature, key) in MONITOR_SWITCHES.items():
-			values = {}
-			for name in self._monitor_displays[param]:
-				try:
-					values[name] = c.monitor_switch(name, feature)
-				except api.ApiError as e:
-					if e.status == 0:
-						raise
-			upd[key] = values
-		af = self._try('autofocus', c.autofocus)
-		if af:
-			upd['autofocusSupported'] = bool(af.get('supported', True))
-			upd['autofocus'] = 'Continuous' if af.get('enabled') and af.get('mode') == 'Continuous' else 'Off'
-		ir = self._try('iris', c.iris)
-		if ir and ir.get('apertureStop') is not None:
-			upd['iris'] = format_f_stop(ir['apertureStop'])
-			upd['irisAuto'] = bool(ir.get('continuousApertureAutoExposure'))
-		z = self._try('lens', c.zoom)
-		if z:
-			upd['lens'] = z.get('focalLength')
-		if self._lenses:
-			active = self._try('lenscams', c.get, '/lens/cameras/active')
-			if active:
-				upd['lensId'] = active.get('id')
-				if active.get('facing') == 'front':
-					upd['lens'] = lens_names(self._lenses).get(active.get('id'), 'Front')
-		sl = self._try('slate', c.slate)
-		if sl:
-			upd['letter'] = (sl.get('project') or {}).get('camera')
-			upd['reel'] = (sl.get('clip') or {}).get('reel')
-			upd['clipName'] = (sl.get('clip') or {}).get('clipName')
-		st = self._try('stream', c.stream_status)
-		if st:
-			status, bitrate = st.get('status'), st.get('bitrate') or 0
-			upd['streaming'] = status
-			upd['streamBitrate'] = bitrate
-			if status not in (None, 'Idle'):
-				plat = self._try('stream', c.active_platform) or {}
-				upd['liveOurs'] = plat.get('platform') == livestream.PLATFORM_ID
-			else:
-				upd['liveOurs'] = False
-			upd['liveWarning'] = self._stream_warning(status, bitrate, st.get('effectiveVideoFormat'))
-		self._update(**upd)
+		self._resync_due = False
+		self._auto_after = 0.0
+		self._timings.clear()
+		self._baseline = None
+		self._update(connecting=True, online=False, error=None, errorTime=0, recordPending=False, events='connecting',
+					 answerMs=None, baselineMs=None, delayMs=None, health=None)
+		self.manager._log('{}: reconnecting'.format(self._label()))
+		self._start_channel()
 
 	# --- recording format -------------------------------------------------------
 
@@ -780,7 +1201,7 @@ class CameraWorker(threading.Thread):
 			self.saved_format = None
 			self.manager._save_later()
 		self._update(streaming='Idle', liveOurs=False, liveWarning=None, **self._format_state())
-		self.manager._log('{}: live view ended, recording format restored'.format(self.state['name'] or self.state['address']))
+		self.manager._log('{}: live view ended, recording format restored'.format(self._label()))
 
 	def _stream_warning(self, status, bitrate, video_format):
 		if status != 'Streaming' or bitrate:
@@ -856,16 +1277,27 @@ class CameraWorker(threading.Thread):
 		c = self.client
 		label = kind
 		try:
-			if kind == 'set':
+			if kind == 'event':
+				self._event(*args)
+			elif kind == 'open':
+				label = 'connecting'
+				self._opened(*args)
+			elif kind == 'closed':
+				self._closed(*args)
+			elif kind == 'refused':
+				label = 'connecting'
+				self._refused(*args)
+			elif kind == 'set':
 				param, value = args
 				label = 'set {}'.format(param)
 				self._set(param, value)
-				self._next_full = 0  # read back promptly
+				self._read_back(param, value)
 			elif kind == 'autowb':
 				label = 'auto WB'
 				c.auto_white_balance()
 				self.release_wb_hold()
-				self._next_full = 0
+				self._read('wb', '/video/whiteBalance')
+				self._read('tint', '/video/whiteBalanceTint')
 			elif kind == 'stream':
 				label = 'live view'
 				if args[0]:
@@ -880,13 +1312,42 @@ class CameraWorker(threading.Thread):
 				else:
 					c.stream(False)
 					self._update(streaming='Idle', liveOurs=False)
-				self._next_full = 0
+				self._read('stream', '/livestreams/0')
+			elif kind == 'resync':
+				label = 'reading the camera'
+				self._resync(light=bool(args and args[0]))
 			elif kind == 'refresh':
 				self._reconnect()
 		except api.ApiError as e:
 			self._error('{} failed ({})'.format(label, e))
+			if e.status == 0 and self._legacy:
+				# a camera without an event channel only shows it is gone when a command fails
+				self._update(online=False)
+				self._connected = False
+				if self.channel:
+					self.channel.retry_now()
 		except (ValueError, TypeError) as e:
 			self._error('{}: bad value ({})'.format(label, e))
+
+	def _read_back(self, param, value):
+		"""After a command, read what the camera took. Skipped during a take when its
+		events are coming in: they confirm, and a take gets no request it can do without."""
+		if self._listening and self.state['recording']:
+			return
+		if not self._listening and not self._legacy:
+			self._resync_due = True   # the channel is down: everything is read when it is back
+			return
+		for path in self.READ_BACK.get(param, ()):
+			if path == '/lens/cameras/active' and not self._lenses:
+				continue
+			self._read(self.PATH_KEYS[path], path)
+		if param in MONITOR_SWITCHES and isinstance(value, dict):
+			display, (feature, key) = str(value.get('display')), MONITOR_SWITCHES[param]
+			if display in self._monitor_displays[param]:
+				on = self.client.monitor_switch(display, feature)
+				self._update(**{key: dict(self.state.get(key) or {}, **{display: on})})
+		if self._caps_dirty and param in ('fps', 'codec', 'resolution'):
+			self._load_capabilities()   # the lists of supported values follow the format
 
 	def _set(self, param, value):
 		c = self.client
@@ -927,7 +1388,8 @@ class CameraWorker(threading.Thread):
 				self._update(autofocus='Off')
 			self.focus_hold = c.focus() if lock else None
 			self.focus_locked = lock
-			self._update(focusLocked=lock)
+			self._focus_restoring = False
+			self._update(focusLocked=lock, **({'focus': self.focus_hold} if self.focus_hold is not None else {}))
 			self.manager._save_later()
 		elif param == 'iso':
 			self._lock_exposure()
@@ -1016,12 +1478,33 @@ class CameraWorker(threading.Thread):
 			self._update(wbHold={})
 			self.manager._save_later()
 
-	def _restore_wb(self, upd):
-		"""Put back a held WB/tint the phone has changed (auto WB, someone on the phone)."""
+	def _holding(self, key):
+		return bool(self.wb_hold) if key == 'wb' else self.focus_locked and self.focus_hold is not None
+
+	def _enforce_holds(self, now):
+		"""Put back a held white balance or a locked focus the phone has changed. Driven by
+		the camera's events; each restore is one write, no more often than the intervals
+		above, and none while the camera records (unless HOLD_DURING_TAKE)."""
+		for key in list(self._hold_check):
+			if not self._holding(key):
+				self._hold_check.discard(key)
+				continue
+			if now < self._hold_after[key] or not self._may_send(during_take=self.HOLD_DURING_TAKE):
+				continue
+			self._hold_check.discard(key)
+			if key == 'wb' and self._restore_wb():
+				self._hold_after[key] = now + self.WB_RESTORE_EVERY
+			elif key == 'focus' and self._restore_focus():
+				self._hold_after[key] = now + self.FOCUS_RESTORE_EVERY
+
+	def _restore_wb(self):
+		"""Put back a held WB/tint the phone has changed (auto WB, someone on the phone).
+		Returns whether anything was sent."""
 		drifted = False
+		upd = {}
 		for key, setter, getter in (('wb', self.client.set_white_balance, self.client.white_balance),
 									('tint', self.client.set_tint, self.client.tint)):
-			held, now = self.wb_hold.get(key), upd.get(key)
+			held, now = self.wb_hold.get(key), self.state.get(key)
 			if held is None or now is None or now == held:
 				continue
 			drifted = True
@@ -1037,39 +1520,38 @@ class CameraWorker(threading.Thread):
 				self.wb_hold[key] = upd[key]
 				self.manager._save_later()
 			self.manager._log('{}: {} changed on the phone ({} -> {}), restored'.format(
-				self.state['name'] or self.state['address'], 'white balance' if key == 'wb' else 'tint', held, now))
+				self._label(), 'white balance' if key == 'wb' else 'tint', held, now))
 		if drifted:
+			if time.monotonic() - self._wb_last_restore > 4 * self.WB_RESTORE_EVERY:
+				self._wb_restores = 0   # it had stayed put for a while
+			self._wb_last_restore = time.monotonic()
 			self._wb_restores += 1
 			if self._wb_restores == 3:
 				self._error('white balance keeps changing on the phone: turn off auto white balance in the app')
-		else:
-			self._wb_restores = 0
-		upd['wbHold'] = dict(self.wb_hold)
+			self._update(wbHold=dict(self.wb_hold), **upd)
+		return drifted
 
-	def _hold_focus(self, focus):
-		"""While focus is locked, put it back if it moved; returns the focus to show."""
-		if not self.focus_locked:
-			return focus
-		if self.focus_hold is None:
-			self.focus_hold = focus
-			self.manager._save_later()
-			return focus
+	def _restore_focus(self):
+		"""While focus is locked, put it back if it moved. Returns whether anything was sent."""
+		focus = self.state.get('focus')
+		if focus is None or self.focus_hold is None:
+			return False
 		if abs(focus - self.focus_hold) < 1.5 / 255:   # the phone steps in 1/255 and may read back one off
 			self._focus_restoring = False
-			return focus
+			return False
 		try:
 			self.client.set_focus(self.focus_hold)   # also ends continuous AF
 		except api.ApiError as e:
 			if e.status == 0:
 				raise
 			self._error('could not restore locked focus ({})'.format(e))
-			return focus
-		if not self._focus_restoring:   # one log line per disturbance, not per poll
+			return True
+		if not self._focus_restoring:   # one log line per disturbance, not per restore
 			self._focus_restoring = True
 			self.manager._log('{}: focus moved on the phone ({:.0f}% -> {:.0f}%), restored'.format(
-				self.state['name'] or self.state['address'], self.focus_hold * 100, focus * 100))
-		self._update(autofocus='Off')
-		return self.focus_hold
+				self._label(), self.focus_hold * 100, focus * 100))
+		self._update(focus=self.focus_hold, autofocus='Off')
+		return True
 
 	HDMI_VIDEO_FEED = 4   # appsettings.hdmiOut in presets: 0 = mirror display, 4 = video feed
 
@@ -1137,25 +1619,50 @@ class CameraWorker(threading.Thread):
 
 	def do_record(self, recording, go, skip_reason=None):
 		"""Runs on a short-lived thread; `go` is a shared Event so every camera
-		fires as close to simultaneously as possible."""
+		fires as close to simultaneously as possible. With an event channel the
+		tally follows the camera's own word, and a REC or STOP it acknowledged
+		without carrying out is reported."""
 		self._update(recordPending=True)
 		go.wait(2.0)
 		if skip_reason:
 			self._error('REC skipped: ' + skip_reason)
 			self._update(recordPending=False)
 			return
+		recording = bool(recording)
+		what = 'REC' if recording else 'STOP'
 		try:
+			with self.manager.lock:
+				self._rec_confirm.clear()
+				self._rec_expected = recording
+				if recording:
+					self._rec_started = time.time()
+					self.state['stopAlert'] = None
+				else:
+					self._expect_stop_until = time.monotonic() + 10
 			self.client.record(recording)
-			if recording:
-				self._rec_started = time.time()
-				self._update(recording=True, stopAlert=None)
-			else:
-				self._update(recording=False)
+			if not self._listening:
+				self._update(recording=recording)
+			elif not self._rec_confirm.wait(self.REC_CONFIRM):
+				# No event: ask once. This is the one read a take may get.
+				try:
+					actual = self.client.is_recording()
+				except api.ApiError as e:
+					actual = None
+					self._error('{} sent; the camera has not confirmed it ({})'.format(what, e))
+				if actual is not None and actual != recording:
+					msg = '{} ACKNOWLEDGED BUT NOT CARRIED OUT: the camera is {} recording'.format(
+						what, 'still' if actual else 'not')
+					self._error(msg)
+					self.manager.alert('{}: {}'.format(self._label(), msg))
+				if actual is not None:
+					with self.manager.lock:
+						self.state['recording'] = actual
+						self._rec_reported = actual
 		except api.ApiError as e:
-			self._error('{} failed ({})'.format('REC' if recording else 'STOP', e))
+			self._error('{} failed ({})'.format(what, e))
 		finally:
+			self._rec_expected = None
 			self._update(recordPending=False)
-			self._next_fast = 0
 			self.commands.put(('wake',))
 
 
@@ -1306,6 +1813,7 @@ class CameraManager:
 				w.state['name'] = str(name).strip()
 			if active is not None:
 				w.state['active'] = bool(active)
+		w.queue('wake')   # arming makes deferred work due
 		self._save_later()
 
 	def _worker(self, cam_id):
@@ -1602,6 +2110,7 @@ class CameraManager:
 				getattr(client, action + '_preset')(name)
 				if action == 'apply':
 					self._worker(cam_id).release_wb_hold()   # the preset brings its own white balance
+					self._worker(cam_id).queue('resync')     # and can change any other setting
 				return as_json(200, {'ok': True})
 			return as_json(404, {'error': 'no route'})
 		except KeyError as e:
@@ -1668,6 +2177,9 @@ class CameraManager:
 				self.stream([cam_id], p['enabled'])
 			elif action == 'refresh':
 				self.refresh(cam_id)
+			elif action == 'resync':
+				# read the values the event channel does not carry (a row was expanded)
+				self._worker(cam_id).queue('resync', True)
 			else:
 				raise KeyError('no route')
 			return None
