@@ -374,11 +374,10 @@ def make_handler(cam, verbose):
 					new = [p for p in props if p not in me.properties]
 					me.properties.update(props)
 					values = [(p, cam.read({v: k for k, v in cam.EVENT_NAMES.items()}.get(p, p))) for p in new]
+				# like the app: the answer to a subscription carries the current values
 				me.send(0x1, json.dumps({'type': 'response', 'id': msg.get('id'),
-										 'data': {'action': 'subscribe', 'properties': props, 'success': True}}).encode())
-				for p, value in values:   # the current state, once
-					if value is not None:
-						me.event(p, value)
+										 'data': {'action': 'subscribe', 'properties': props, 'success': True,
+												  'values': {p: v for p, v in values if v is not None}}}).encode())
 			elif action == 'unsubscribe':
 				with lock:
 					me.properties.difference_update(props)

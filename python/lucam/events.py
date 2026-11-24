@@ -325,6 +325,8 @@ class EventChannel(threading.Thread):
 			payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 		return fin, opcode, payload
 
+	# Not named _handle: threading.Thread has an attribute of that name from Python 3.13 on,
+	# which would replace the method and make every message fail.
 	def _dispatch(self, raw):
 		try:
 			msg = json.loads(raw.decode('utf-8'))

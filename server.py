@@ -38,17 +38,20 @@ def main():
 	ap.add_argument('--config', default=os.path.join(ROOT, 'cameras.json'),
 					help='camera list file (default: cameras.json next to this script)')
 	ap.add_argument('--open', action='store_true', help='open the control panel in the browser')
+	ap.add_argument('--log', action='store_true',
+					help='write log files: events, and every request sent to the cameras (off by default)')
 	ap.add_argument('--log-dir', default=os.path.join(ROOT, 'logs'),
-					help='folder for the log files of each run (default: logs/ next to this script)')
-	ap.add_argument('--no-log', action='store_true', help='keep the log in memory only, write no files')
+					help='folder for the log files, with --log (default: logs/ next to this script)')
 	ap.add_argument('--no-request-log', action='store_true',
-					help='write the events file but not the file listing every request sent to the cameras')
+					help='with --log: write the events file but not the file listing every request')
+	ap.add_argument('--log-keep-days', type=float, default=30,
+					help='with --log: delete log files older than this at start, 0 keeps all (default: 30)')
 	ap.add_argument('--no-alert-sound', action='store_true',
-					help='no system notification and sound when a camera stops recording by itself (macOS)')
+					help='no system notification and sound with an alarm (macOS)')
 	args = ap.parse_args()
 
-	manager = CameraManager(config_path=args.config, log_dir=None if args.no_log else args.log_dir,
-							log_requests=not args.no_request_log)
+	manager = CameraManager(config_path=args.config, log_dir=args.log_dir if args.log else None,
+							log_requests=not args.no_request_log, log_keep_days=args.log_keep_days)
 	manager.http_port = args.port
 	manager.alert_sound = not args.no_alert_sound
 

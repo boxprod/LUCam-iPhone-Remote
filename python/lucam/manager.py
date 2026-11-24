@@ -190,8 +190,7 @@ class CameraWorker(threading.Thread):
 	  command, when a row is expanded, when a format change makes the lists of
 	  supported values stale.
 	- While the channel is down the worker sends nothing of its own accord.
-	- While a camera records the worker sends nothing of its own accord either:
-	  REC and STOP are the only requests a take needs.
+	- With QUIET_DURING_TAKE, a recording camera is sent nothing but REC and STOP.
 	- An unarmed camera is listened to and sent nothing of the worker's accord.
 	- One request at a time per camera (api.CameraClient holds the lock).
 	- Every answer is timed. A camera whose answers slow down is flagged, since
@@ -220,7 +219,11 @@ class CameraWorker(threading.Thread):
 	WB_RESTORE_EVERY = 3.0     # s between two restores of a held white balance
 	FOCUS_RESTORE_EVERY = 0.3  # s between two restores of a locked focus
 	LIVE_CHECK_EVERY = 10.0    # s between checks of a live stream that reports no video
-	HOLD_DURING_TAKE = False   # True: a held WB or locked focus is also restored while recording
+	# True: a recording camera is sent nothing but REC and STOP by the worker itself (no timing
+	# read, no restore of a held value until the take ends). Off: with the event channel open,
+	# requests during a take did no harm in the long tests. On a phone that something has
+	# already slowed, they did: the slow-app alarm is what tells you about such a phone.
+	QUIET_DURING_TAKE = False
 
 	# What is read when the event channel opens: (key marking it unsupported, path).
 	CAPABILITY_PATHS = (
@@ -490,9 +493,8 @@ class CameraWorker(threading.Thread):
 		if not self._listening:
 			return   # it dropped again already: the next opening does the reading
 		try:
-			# Whether it records comes first: a recording camera is sent nothing else.
 			self._read('record', '/transports/0/record')
-			if self.state['recording']:
+			if self.state['recording'] and self.QUIET_DURING_TAKE:
 				if first:
 					self.manager._log('{}: it is recording; its settings are read when the take ends'.format(self._label()))
 				return
@@ -526,8 +528,8 @@ class CameraWorker(threading.Thread):
 						  'each command, and is not live (↻ reads it again)'.format(self._label()))
 
 	def _resync(self, first=False, light=False):
-		"""Read the camera's state once. Deferred while that is not allowed (it records,
-		or it is unarmed and already known)."""
+		"""Read the camera's state once. Deferred while that is not allowed (it is unarmed
+		and already known, or it records and takes are kept quiet)."""
 		if self._legacy:
 			self._read_all() if not light else self._read_unbroadcast()
 			return
@@ -562,10 +564,11 @@ class CameraWorker(threading.Thread):
 		if isinstance(props, list):
 			self.channel.subscribe([p for p in props if isinstance(p, str)])
 
-	def _may_send(self, armed=True, during_take=False):
+	def _may_send(self, armed=True):
 		"""Whether the worker may send this camera a request of its own accord."""
 		s = self.state
-		return bool(self._listening and s['online'] and (during_take or not (s['recording'] or s['recordPending']))
+		return bool(self._listening and s['online'] and not s['recordPending']
+					and not (self.QUIET_DURING_TAKE and s['recording'])
 					and (s['active'] or not armed) and time.monotonic() >= self._auto_after)
 
 	def _unanswered(self, what, e):
@@ -756,11 +759,12 @@ class CameraWorker(threading.Thread):
 			self._zoom_desc = v
 			upd.update(self._lens_options())
 		elif path == '/lens/focus':
-			if v.get('normalised') is not None:
-				upd['focus'] = v['normalised']
+			focus = v.get('normalised', v.get('normalized'))
+			if focus is not None:
+				upd['focus'] = focus
 				if self.focus_locked:
 					if self.focus_hold is None:
-						self.focus_hold = v['normalised']
+						self.focus_hold = focus
 						self.manager._save_later()
 					self._hold_check.add('focus')
 		elif path == '/video/iso':
@@ -1330,10 +1334,9 @@ class CameraWorker(threading.Thread):
 			self._error('{}: bad value ({})'.format(label, e))
 
 	def _read_back(self, param, value):
-		"""After a command, read what the camera took. Skipped during a take when its
-		events are coming in: they confirm, and a take gets no request it can do without."""
-		if self._listening and self.state['recording']:
-			return
+		"""After a command, read what the camera took."""
+		if self.QUIET_DURING_TAKE and self._listening and self.state['recording']:
+			return   # its events confirm
 		if not self._listening and not self._legacy:
 			self._resync_due = True   # the channel is down: everything is read when it is back
 			return
@@ -1484,12 +1487,12 @@ class CameraWorker(threading.Thread):
 	def _enforce_holds(self, now):
 		"""Put back a held white balance or a locked focus the phone has changed. Driven by
 		the camera's events; each restore is one write, no more often than the intervals
-		above, and none while the camera records (unless HOLD_DURING_TAKE)."""
+		above."""
 		for key in list(self._hold_check):
 			if not self._holding(key):
 				self._hold_check.discard(key)
 				continue
-			if now < self._hold_after[key] or not self._may_send(during_take=self.HOLD_DURING_TAKE):
+			if now < self._hold_after[key] or not self._may_send():
 				continue
 			self._hold_check.discard(key)
 			try:
@@ -1647,7 +1650,7 @@ class CameraWorker(threading.Thread):
 			if not self._listening:
 				self._update(recording=recording)
 			elif not self._rec_confirm.wait(self.REC_CONFIRM):
-				# No event: ask once. This is the one read a take may get.
+				# No event: ask once.
 				try:
 					actual = self.client.is_recording()
 				except api.ApiError as e:
@@ -1671,7 +1674,8 @@ class CameraWorker(threading.Thread):
 
 
 class CameraManager:
-	def __init__(self, config_path=None, web_dir=WEB_DIR, autosave=True, log_dir=None, log_requests=True):
+	def __init__(self, config_path=None, web_dir=WEB_DIR, autosave=True, log_dir=None, log_requests=True,
+				 log_keep_days=30):
 		self.lock = threading.RLock()
 		self.config_path = config_path
 		self.web_dir = web_dir
@@ -1680,7 +1684,8 @@ class CameraManager:
 		self.global_values = {}
 		self.log = []
 		# log_dir: folder for the run's log files (None: in-memory log only, as in the panel)
-		self.files = filelog.FileLog(log_dir, requests=log_requests) if log_dir else None
+		self.files = filelog.FileLog(log_dir, requests=log_requests, keep_days=log_keep_days) if log_dir else None
+		self._by_address = {}   # (host, port) -> worker, for naming requests in the log
 		if self.files:
 			api.request_observer = self._observe_request
 		self.discovery = {'running': False, 'mode': None, 'results': [], 'error': None, 'finished': 0}
@@ -1768,19 +1773,17 @@ class CameraManager:
 		except OSError:
 			pass
 
-	def _observe_request(self, sent_at, host, port, method, path, status, took, error):
+	def _observe_request(self, sent_at, host, port, method, path, status, took, error, sent):
 		"""api.request_observer: every request any worker sends, written to the request log
 		under the camera's name (or its address while it has none)."""
-		name = host
-		with self.lock:
-			for w in self.workers.values():
-				try:
-					if api.parse_address(w.client.address)[1:] == (host, port):
-						name = w.state['name'] or host
-						break
-				except ValueError:
-					pass
-		self.files.request(sent_at, name, method, path, status, took, error)
+		w = self._by_address.get((host, port))
+		if w is None or w.client.host != host or w.client.port != port:
+			# a camera added, or one now reached on another address: rebuild the map
+			with self.lock:
+				self._by_address = {(x.client.host, x.client.port): x for x in self.workers.values()}
+			w = self._by_address.get((host, port))
+		name = (w.state['name'] or w.state['deviceName'] or host) if w else host
+		self.files.request(sent_at, name, method, path, status, took, error, sent)
 
 	# --- cameras ------------------------------------------------------------------
 

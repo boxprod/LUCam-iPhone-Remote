@@ -4,8 +4,8 @@
     python3 tests/test_engine.py
 
 The rules under test: the event channel is open before anything is sent; nothing
-is read on a timer; nothing is sent during a take, to an unarmed camera, or while
-the channel is down; the alarms fire. Standard library only.
+is read on a timer; nothing is sent to an unarmed camera or while the channel is
+down; the alarms fire. Standard library only.
 """
 
 import json
@@ -136,8 +136,19 @@ class EngineTest(unittest.TestCase):
 		self.assertEqual(st['requests'] - before, 2, 'a take needs REC and STOP, nothing else: {}'.format(st['last'][-6:]))
 		self.assertEqual(st['whileRecording'], 0)
 
-	def test_nothing_is_sent_during_a_take(self):
-		r = self.rig(HEALTH_INTERVAL=0.2)
+	def test_a_held_value_is_put_back_during_a_take(self):
+		r = self.rig()
+		r.manager.set_param(r.id, 'wb', 4300)
+		self.assertTrue(wait(lambda: r.state()['wbHold'].get('wb') == 4300))
+		r.manager.record([r.id], True)
+		self.assertTrue(wait(lambda: r.state()['recording'] and not r.state()['recordPending']))
+		r.mock('POST', 'set', {'wb': 7000})
+		self.assertTrue(wait(lambda: r.cam.state['wb'] == 4300), r.log())
+		self.assertTrue(r.state()['recording'])
+		self.assertEqual(r.stats()['withoutListener'], 0)
+
+	def test_quiet_takes_send_nothing_during_a_take(self):
+		r = self.rig(HEALTH_INTERVAL=0.2, QUIET_DURING_TAKE=True)
 		r.manager.set_param(r.id, 'wb', 4300)   # held from here on
 		self.assertTrue(wait(lambda: r.state()['wbHold'].get('wb') == 4300))
 		r.manager.record([r.id], True)
@@ -257,12 +268,13 @@ class EngineTest(unittest.TestCase):
 		r.manager.set_param(r.id, 'iso', 800)
 		self.assertTrue(wait(lambda: r.state()['iso'] == 800))
 
-	def test_a_camera_found_recording_is_left_alone_until_the_take_ends(self):
+	def test_quiet_takes_leave_a_camera_found_recording_alone(self):
 		server, cam = mock_camera.start(0, 'Rolling', host='127.0.0.1')
 		self.addCleanup(server.shutdown)
 		cam.set_recording(True)
-		saved = {k: getattr(CameraWorker, k) for k in FAST}
-		for k, v in FAST.items():
+		settings = dict(FAST, QUIET_DURING_TAKE=True)
+		saved = {k: getattr(CameraWorker, k) for k in settings}
+		for k, v in settings.items():
 			setattr(CameraWorker, k, v)
 		self.addCleanup(lambda: [setattr(CameraWorker, k, v) for k, v in saved.items()])
 		manager = CameraManager(config_path=None, autosave=False)
@@ -279,6 +291,19 @@ class EngineTest(unittest.TestCase):
 		self.assertTrue(wait(lambda: 'HDMI' in state()['displayLuts']), 'the state was not read when the take ended')
 		self.assertIsNone(state()['stopAlert'])
 		self.assertLessEqual(cam.stats['whileRecording'], 1)
+
+
+	def test_no_thread_class_hides_one_of_pythons_own_thread_attributes(self):
+		# A method named like an attribute threading.Thread sets on itself is replaced by it
+		# when the thread starts (Python 3.13 added _handle), and then fails when called.
+		import threading
+		from lucam import events
+		t = threading.Thread(target=lambda: None)
+		t.start()
+		t.join()
+		for cls in (events.EventChannel, CameraWorker):
+			clash = sorted(n for n in vars(cls) if n in vars(t))
+			self.assertEqual(clash, [], '{} defines {}'.format(cls.__name__, clash))
 
 
 if __name__ == '__main__':

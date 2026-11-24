@@ -83,31 +83,47 @@ lucam-remote --open
 
 Or double-click **LUCam iPhone Remote.command**. The panel is at
 http://localhost:9980. Options: `--port 9980`, `--config path/to/cameras.json`,
-`--log-dir path/to/logs`. Quit with Ctrl-C or by closing the Terminal window.
+`--log` (see below). Quit with Ctrl-C or by closing the Terminal window.
 Quitting stops the live view and restores any camera that is in live mode.
 
 ### Log files
 
-Each run writes two files to `logs/` (next to `server.py`, or `--log-dir`):
+Off by default: the panel only keeps its last 50 log lines in memory. Start
+with `lucam-remote --log` to write two files per run to `logs/` (next to
+`server.py`, or `--log-dir path/to/logs`):
 
 - `lucam-YYYYMMDD-HHMMSS.log`: what the panel's log shows (cameras found, values
-  changed or restored, errors), plus every value written to a camera and every
-  request that failed, with the time to the millisecond.
-- `lucam-YYYYMMDD-HHMMSS.requests.csv`: every request sent to every camera, with
-  the time it was sent, how long the camera took to answer and the status. Laid
-  over a clip's timecode this tells what the app asked a phone at any moment, and
-  how each phone's answer time moved through the day. It stays small, since
-  cameras are no longer polled; `--no-request-log` skips it.
+  changed or restored, errors), plus every write sent to a camera with the
+  value it carried (`PUT /video/iso {"iso": 800} -> 204`) and failed requests,
+  with the time to the millisecond. A camera that stops answering gets one line
+  when it stops and one when it answers again, not one per attempt.
+- `lucam-YYYYMMDD-HHMMSS.requests.csv`: every request sent to every camera: when
+  it was sent, the camera, the path, what a write carried, the status and how
+  long the camera took to answer. It shows what the controller asked a phone at
+  any moment, and how each phone's answer time moved through the day.
 
-`--no-log` keeps the log in memory only, as before.
+Cameras are listened to, not polled, so the requests file stays small: a line
+per command, plus one timing read per armed camera every 30 seconds.
+`--no-request-log` writes only the events file. Log files older than 30 days are
+deleted when the controller starts (`--log-keep-days 7` to change it, `0` to keep
+everything).
+
+**Times are this Mac's clock, not the phones' timecode.** To line a request up
+with a moment in a clip, you need the offset between the two: the phones set
+their timecode from their own clock (or a sync source), which can be a second
+or more away from the Mac's. A reliable way is a reference event in both: for
+example the REC press, logged as `POST /transports/0/record -> 204` in the
+events file, against the clip's first frame. Keep the Mac's clock synced
+too (System Settings > General > Date & Time > Set time automatically).
 
 ### Alarms
 
 The camera's API reports no dropped frames, no load and no temperature, so the
 controller raises the alarms itself. Each one shows as a blinking red line in the
-camera's row, plays three beeps, writes an `ALERT` line in the log and, on a Mac,
-shows a system notification with a sound even when the panel is in the
-background (`--no-alert-sound` turns that off).
+camera's row, plays three beeps, writes an `ALERT` line in the log (and in the
+events file, with `--log`) and, on a Mac, shows a system notification with a
+sound even when the panel is in the background (`--no-alert-sound` turns that
+off).
 
 - **Stopped by the camera.** A camera that was recording reports that it is not,
   and LUCam did not send the STOP: the camera, or someone at the phone, ended the
@@ -160,9 +176,6 @@ preset is removed from the phone afterwards (`--keep` leaves it).
     as the phone reports a change, at most once every 3 seconds. **Auto white
     balance** (⋯ menu, or AWB in the global row) or applying a preset releases
     the hold. The hold is saved in `cameras.json`.
-  - Nothing is put back while the camera records: a take gets no request it
-    can do without. A value that moved during a take is restored when the take
-    ends. (`HOLD_DURING_TAKE` in `python/lucam/manager.py` changes that.)
 - **▶** before a camera's name expands its row with focus controls (the
   browser remembers which rows are open):
   - **Focus** slider, 0–100 % on the phone's own scale. Moving it turns
@@ -171,12 +184,11 @@ preset is removed from the phone afterwards (`--keep` leaves it).
   - **Lock focus**: turns autofocus off, refuses every focus change from here,
     and holds the focus position: if anything on the phone moves it (tap to
     focus, an autofocus pass), the controller puts it back as soon as the
-    phone reports the move, except during a take (see above). The app's own
-    focus lock isn't in its API, so the controller holds it, saved in
-    `cameras.json`. A tap still makes the phone refocus for about a second
-    before it's put back, and during a take it is not put back at all: to
-    stop that, also press the lock under the focus slider in the app. The
-    slider here keeps working while the app's lock is on.
+    phone reports the move. The app's own focus lock isn't in its API, so the
+    controller holds it, saved in `cameras.json`. A tap still makes the phone
+    refocus for about a second before it's put back: to stop that, also press
+    the lock under the focus slider in the app. The slider here keeps working
+    while the app's lock is on.
   - **Presets**: the camera's presets (active one marked), with **⬇ Download**
     (saves the `.cset` file), **Apply**, **Delete**, **Save current…** (saves
     the camera's current settings as a new preset) and **⬆ Upload…**
@@ -216,18 +228,21 @@ The controller is built around that:
    events. Settings are read once when the channel opens, then only on demand:
    after a command, when a row is expanded (autofocus and the screen's LUT
    have no event), after a format change.
-3. **It sends nothing during a take.** REC and STOP are the only requests a
-   recording camera gets from the controller itself. In a test on one slowed
-   phone, takes lost frames while requests kept arriving and a take with none
-   arriving lost nothing, so this may also limit the damage on a phone that
-   something else has slowed. Commands you give during a take still go.
-4. **One request at a time per phone.** The app serves one request per
+3. **One request at a time per phone.** The app serves one request per
    connection and closes it.
-5. **It times every answer.** Every 30 seconds an armed, idle camera gets one
-   small read, to measure how long the app takes. That time is shown under the
+4. **It times every answer.** Every 30 seconds an armed camera gets one small
+   read, to measure how long the app takes. That time is shown under the
    camera's name and drives the *App slow* alarm.
-6. **It sends nothing to a camera that is not armed**, beyond what you ask for
+5. **It sends nothing to a camera that is not armed**, beyond what you ask for
    on its row.
+
+A take is treated like any other moment: with the event channel open, requests
+during recordings did no harm in the long tests. On a phone that something
+else has already slowed they do (one slowed phone lost frames in takes while
+requests kept arriving, and none in a take without any); the *App slow* alarm
+is what tells you about such a phone. `QUIET_DURING_TAKE = True` in
+`python/lucam/manager.py` makes the controller send a recording camera nothing
+but REC and STOP.
 
 A camera with no event channel (not the iPhone app at 3.5) is marked *not
 live*: its settings are read once and after each command, and ↻ reads them
@@ -248,8 +263,9 @@ listener protects the phone for as long as LUCam runs and is connected to it.
   *Stopped by the camera* alarm then tells you at once.
 - Soak test, on one phone of each model, with the accessories and settings of
   the shoot: relaunch the app, run LUCam for the length of the day, record 30
-  seconds every hour. The answer time under the camera's name must stay flat,
-  and `logs/*.requests.csv` keeps the figures.
+  seconds every hour. The answer time under the camera's name must stay flat;
+  started with `--log`, the controller keeps the figures in
+  `logs/*.requests.csv`.
 
 ## Network interfaces
 
@@ -370,8 +386,8 @@ python3 tests/test_engine.py
 ```
 
 checks the controller against such cameras: no request before the event
-channel is open, none on a timer, none during a take or to an unarmed camera,
-and each alarm.
+channel is open, none on a timer, none to an unarmed camera or while the
+channel is down, and each alarm.
 
 ## Notes from real-iPhone testing
 
