@@ -123,6 +123,7 @@ class MockCamera:
 		self.state = make_state(name, iris_controllable)
 		self.lock = threading.RLock()
 		self.events = events
+		self.ws_broken = False   # lists its events, but the WebSocket cannot be opened
 		self.listeners = []
 		self.delay = 0.0
 		self.deaf = False
@@ -325,15 +326,18 @@ def make_handler(cam, verbose):
 		def _websocket(self):
 			key = self.headers.get('Sec-WebSocket-Key', '')
 			accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+			# counted as listening before the answer goes out, so a request that follows
+			# the answer at once is never taken for one with no listener
+			me = Listener(self.wfile)
+			with lock:
+				cam.listeners.append(me)
 			self.send_response(101, 'Switching Protocols')
 			self.send_header('Upgrade', 'websocket')
 			self.send_header('Connection', 'Upgrade')
 			self.send_header('Sec-WebSocket-Accept', accept)
 			self.end_headers()
+			self.wfile.flush()
 			self.close_connection = True
-			me = Listener(self.wfile)
-			with lock:
-				cam.listeners.append(me)
 			try:
 				while me.alive:
 					head = self.rfile.read(2)
@@ -389,7 +393,7 @@ def make_handler(cam, verbose):
 				return self._mock('GET')
 			p = self._path()
 			if p == '/event/websocket' and 'websocket' in self.headers.get('Upgrade', '').lower():
-				if not cam.events:
+				if not cam.events or cam.ws_broken:
 					return self._send(404, {'error': 'not found'})
 				return self._websocket()
 			self._arrive('GET', p)

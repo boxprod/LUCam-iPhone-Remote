@@ -189,7 +189,9 @@ class CameraWorker(threading.Thread):
 	- State is read once when the channel opens, then only on demand: after a
 	  command, when a row is expanded, when a format change makes the lists of
 	  supported values stale.
-	- While the channel is down the worker sends nothing of its own accord.
+	- A camera without an event channel is polled, as before, and labelled as such.
+	  So is one whose channel has dropped, until it is back; if that lasts, on a
+	  camera that does have the channel, the worker raises the alarm.
 	- With QUIET_DURING_TAKE, a recording camera is sent nothing but REC and STOP.
 	- An unarmed camera is listened to and sent nothing of the worker's accord.
 	- One request at a time per camera (api.CameraClient holds the lock).
@@ -204,7 +206,16 @@ class CameraWorker(threading.Thread):
 	REC_GRACE = 3.0            # s after REC during which 'not recording' is not an alarm
 	REC_CONFIRM = 3.0          # s to wait for the camera to confirm a REC or STOP by an event
 	TICK = 1.0                 # housekeeping interval; a tick sends nothing by itself
-	OFFLINE_AFTER = 3.0        # s without the event channel before the camera shows as offline
+	OFFLINE_AFTER = 3.0        # s without the event channel before an unarmed camera shows as offline
+	# Without the event channel the controller asks, as it always did: for a camera that has
+	# none, and for one whose channel has dropped, until it is back.
+	POLL_FAST = 0.5            # record state, timecode, focus
+	POLL_FOCUS_LOCKED = 0.2    # while focus is locked: undo a tap to focus quickly
+	POLL_FULL = 3.0            # all settings
+	RETRY_OFFLINE = 2.0
+	POLL_AFTER_DROP = 1.0      # s to let a dropped channel reopen before polling starts
+	POLLED_ALARM_AFTER = 10.0  # s of polling a camera that has an event channel before the alarm
+	FAST_PATHS = ('/transports/0/record', '/transports/0/timecode', '/lens/focus')
 	PING_AFTER = 5.0           # s of silence on the event channel before a ping
 	SILENT_AFTER = 10.0        # s of silence before the connection is taken for dead
 	# The one read on a timer: a single small GET to time the app's answer, only for an
@@ -297,6 +308,12 @@ class CameraWorker(threading.Thread):
 		self._connected = False        # its state has been read since it came online
 		self._channel_down_since = None
 		self._caps_dirty = True
+		self._next_fast = 0.0          # polling, while there is no event channel
+		self._next_full = 0.0
+		self._had_channel = False      # its event channel has been open: it is not a camera without one
+		self._lists_events = False     # it lists events to subscribe to, yet the channel cannot be opened
+		self._polled_since = None
+		self._offline_since = None
 		self._resync_due = False       # values to re-read once that is allowed again
 		self._auto_after = 0.0         # no request of the worker's own before this (monotonic)
 		self._next_health = 0.0
@@ -339,8 +356,12 @@ class CameraWorker(threading.Thread):
 			# cleared by the next REC. {'t', 'after', 'timecode'}
 			'stopAlert': None,
 			# The event channel: 'connecting', 'listening', 'lost' (was open, being reopened),
-			# 'none' (this camera has none: its state is not live).
+			# 'none' (this camera does not open one: it is polled).
 			'events': 'connecting', 'listenSince': 0, 'gaps': 0, 'gapSeconds': 0,
+			# 'polled': the camera is being asked for its values on a timer, for want of an event
+			# channel. 'pollAlert' ({'t'}): it has such a channel and has been polled for a while:
+			# on Blackmagic Camera 3.5 that is what slows the app down.
+			'polled': False, 'pollAlert': None,
 			# How long the camera takes to answer a small read, median of the last few (ms),
 			# against the fastest it has been since connecting. 'health': 'ok', 'warn', 'critical'.
 			'answerMs': None, 'baselineMs': None, 'delayMs': None, 'health': None, 'answerTime': 0,
@@ -416,6 +437,8 @@ class CameraWorker(threading.Thread):
 			if self._hold_check:   # a restore is owed: wake when it may be sent
 				due = min(self._hold_after[k] for k in self._hold_check) - time.monotonic()
 				wait = max(0.02, min(wait, due))
+			if self.state['polled'] or self._legacy:
+				wait = max(0.02, min(wait, self._next_fast - time.monotonic()))
 			try:
 				cmd = self.commands.get(timeout=wait)
 			except queue.Empty:
@@ -479,7 +502,9 @@ class CameraWorker(threading.Thread):
 			self._update(address=self.client.address)
 			self.manager._save_later()
 		self._legacy = False
+		self._had_channel = True
 		self._lost_alarmed = False
+		self._offline_since = None
 		upd = {'events': 'listening', 'listenSince': time.time()}
 		if gap is not None:
 			upd.update(gaps=self.state['gaps'] + 1, gapSeconds=round(self.state['gapSeconds'] + gap, 1))
@@ -506,12 +531,12 @@ class CameraWorker(threading.Thread):
 		if self._connected and not self._legacy:
 			self._update(events='lost')
 			self.manager._log('{}: event channel lost ({}); reconnecting'.format(self._label(), reason))
+		self._next_fast = self._next_full = 0.0
 
 	def _refused(self, address):
-		"""A server answers at this address without an event channel (not the iPhone app
-		at 3.5: another Blackmagic camera, older firmware). Its state can only be read
-		once and after each command: polling it is what this controller no longer does."""
-		if self._legacy and self.state['online']:
+		"""A server answers at this address without an event channel (another Blackmagic
+		camera, an older app): it is polled, as the controller always did."""
+		if self._legacy:
 			return
 		if api.probe(address, timeout=1.5) is None:
 			return
@@ -521,17 +546,81 @@ class CameraWorker(threading.Thread):
 			self._update(address=self.client.address)
 			self.manager._save_later()
 		self._legacy = True
+		self._next_fast = self._next_full = 0.0
 		self._update(events='none')
-		self._read_all()
+		try:
+			listing = self._try('eventlist', self.client.get, '/event/list')
+		except api.ApiError:
+			listing = None
+		props = listing.get('events') if isinstance(listing, dict) else listing
+		self._lists_events = bool(props)   # it says it has events, and the channel will not open
+		self.manager._log('{}: no event channel on this camera: it is polled'.format(self._label()))
+
+	def _went_offline(self, reason):
+		if self.state['online'] or self.state['connecting']:
+			self._error('offline ({})'.format(reason))
+			self._offline_since = self._channel_down_since or time.monotonic()
+		self._update(online=False, connecting=False)
+		self._connected = False
+		self._caps_dirty = True
+
+	def _poll(self, now):
+		"""Ask the camera for its values: record state, timecode and focus twice a second,
+		the settings every 3 s. The next pass is timed from the end of this one, so a
+		camera that answers slowly is asked less often, never without a pause."""
+		s = self.state
+		if s['recordPending'] or now < self._auto_after or now < self._next_fast:
+			return
+		try:
+			if not self._connected or self._caps_dirty:
+				self._read_all()
+				self._next_full = time.monotonic() + self.POLL_FULL
+			else:
+				for path in self.FAST_PATHS:
+					self._read(self.PATH_KEYS[path], path)
+				if now >= self._next_full:
+					self._read_values(skip=self.FAST_PATHS)
+					self._next_full = time.monotonic() + self.POLL_FULL
+		except api.ApiError as e:
+			self._went_offline(e)
+			self._next_fast = self._next_full = time.monotonic() + self.RETRY_OFFLINE
+			return
+		self._offline_since = None
+		self._lost_alarmed = False
 		self._update(online=True, connecting=False, lastSeen=time.time())
-		self.manager._log('{}: connected. This camera has no event channel: its state is read once and after '
-						  'each command, and is not live (↻ reads it again)'.format(self._label()))
+		self._next_fast = time.monotonic() + (self.POLL_FOCUS_LOCKED if self.focus_locked else self.POLL_FAST)
+
+	def _watch_polling(self, polled):
+		"""Say that a camera is polled, and raise the alarm when one that has an event
+		channel stays polled: nothing is listening to it, which is what slows the app."""
+		s = self.state
+		polled = bool(polled and s['online'])
+		if polled != s['polled']:
+			self._update(polled=polled)
+		if polled and s['active'] and (self._had_channel or self._lists_events):
+			now = time.monotonic()
+			if self._polled_since is None:
+				self._polled_since = now
+			elif not s['pollAlert'] and now - self._polled_since > self.POLLED_ALARM_AFTER:
+				self._update(pollAlert={'t': time.time()})
+				self.manager.alert('{}: POLLED WITH NOTHING LISTENING - its event channel cannot be opened, so the '
+								   'controller asks it for its values about 11 times a second. On Blackmagic Camera '
+								   '3.5 that slows the app down over hours, until recordings drop frames. Press the '
+								   'reconnect button; if it stays polled, stop the controller'.format(self._label()))
+		else:
+			self._polled_since = None
+			if s['pollAlert']:
+				self._update(pollAlert=None)
 
 	def _resync(self, first=False, light=False):
 		"""Read the camera's state once. Deferred while that is not allowed (it is unarmed
 		and already known, or it records and takes are kept quiet)."""
 		if self._legacy:
 			self._read_all() if not light else self._read_unbroadcast()
+			return
+		if not self._listening:
+			if not light:
+				self._resync_due = True
 			return
 		if not self._may_send(armed=not first and not light):
 			self._resync_due = self._resync_due or not light
@@ -567,8 +656,8 @@ class CameraWorker(threading.Thread):
 	def _may_send(self, armed=True):
 		"""Whether the worker may send this camera a request of its own accord."""
 		s = self.state
-		return bool(self._listening and s['online'] and not s['recordPending']
-					and not (self.QUIET_DURING_TAKE and s['recording'])
+		return bool(s['online'] and not s['recordPending']
+					and not (self.QUIET_DURING_TAKE and s['recording'] and self._listening)
 					and (s['active'] or not armed) and time.monotonic() >= self._auto_after)
 
 	def _unanswered(self, what, e):
@@ -603,20 +692,24 @@ class CameraWorker(threading.Thread):
 		now = time.monotonic()
 		s = self.state
 		down = self._channel_down_since
-		if down is not None and not self._legacy:
-			if s['online'] and now - down > self.OFFLINE_AFTER:
-				self._error('offline (event channel lost)')
-				self._update(online=False, connecting=False)
-				self._connected = False
-				self._caps_dirty = True
-			if s['recording'] and not s['stopAlert'] and not self._lost_alarmed and now - down > self.LOST_WHILE_RECORDING:
+		# No event channel (the camera has none, or it dropped a moment ago): ask instead.
+		# A dropped channel reopens by itself; once the camera stops answering, its return
+		# is left to the channel, so that the listener is there first again.
+		polled = self._legacy or (down is not None and now - down >= self.POLL_AFTER_DROP and s['online'])
+		if polled and (s['active'] or not self._connected):
+			self._poll(now)
+		elif down is not None and not self._legacy and s['online'] and now - down > self.OFFLINE_AFTER:
+			self._went_offline('event channel lost')   # unarmed, so not polled: the channel is all there is
+		self._watch_polling(polled)
+		if not s['online']:
+			since = self._offline_since
+			if s['recording'] and not s['stopAlert'] and not self._lost_alarmed and since is not None \
+					and now - since > self.LOST_WHILE_RECORDING:
 				# a recording camera that stays unreachable: the app died or was left
 				self._lost_alarmed = True
 				self._update(stopAlert={'t': time.time(), 'after': None, 'timecode': s.get('timecode'), 'kind': 'lost'})
 				self.manager.alert('{}: RECORDING CAMERA LOST for {:.0f}s (app not answering: crashed, closed or '
-								   'phone locked?) last tc {}'.format(self._label(), now - down, s.get('timecode')))
-			return
-		if not s['online']:
+								   'phone locked?) last tc {}'.format(self._label(), now - since, s.get('timecode')))
 			return
 		if self._listening:
 			quiet = now - self.channel.last_rx
@@ -637,12 +730,12 @@ class CameraWorker(threading.Thread):
 			self._hold_check.update(k for k in ('wb', 'focus') if self._holding(k))
 			self._next_health = min(self._next_health, now + 2)
 		self._was = {'recording': s['recording'], 'active': s['active']}
-		if self._resync_due and self._may_send(armed=self._connected):
+		if self._resync_due and self._listening and self._may_send(armed=self._connected):
 			self._resync(first=not self._connected)
 		elif self._caps_dirty and self._connected and self._may_send():
 			self._load_capabilities()
 		self._enforce_holds(now)
-		if now >= self._next_health and self._may_send():
+		if now >= self._next_health and self._listening and self._may_send():
 			self._next_health = now + self.HEALTH_INTERVAL
 			try:
 				self._read('record', '/transports/0/record')
@@ -943,10 +1036,10 @@ class CameraWorker(threading.Thread):
 			upd[key] = values
 		self._update(**upd)
 
-	def _read_values(self, monitors=True):
+	def _read_values(self, monitors=True, skip=()):
 		"""Every setting, once."""
 		for key, path in self.VALUE_PATHS:
-			if path == '/lens/cameras/active' and not self._lenses:
+			if path in skip or path == '/lens/cameras/active' and not self._lenses:
 				continue
 			self._read(key, path)
 		if monitors:
@@ -1027,6 +1120,9 @@ class CameraWorker(threading.Thread):
 		self.resolved = len(self.candidates) == 1
 		self.client = self._make_client(self.candidates[0] if not self.resolved else self.state['address'])
 		self._listening = self._legacy = self._connected = False
+		self._had_channel = self._lists_events = False
+		self._polled_since = self._offline_since = None
+		self._next_fast = self._next_full = 0.0
 		self._channel_down_since = None
 		self._caps_dirty = True
 		self._resync_due = False
@@ -1034,7 +1130,7 @@ class CameraWorker(threading.Thread):
 		self._timings.clear()
 		self._baseline = None
 		self._update(connecting=True, online=False, error=None, errorTime=0, recordPending=False, events='connecting',
-					 answerMs=None, baselineMs=None, delayMs=None, health=None)
+					 answerMs=None, baselineMs=None, delayMs=None, health=None, polled=False, pollAlert=None)
 		self.manager._log('{}: reconnecting'.format(self._label()))
 		self._start_channel()
 
@@ -1324,12 +1420,6 @@ class CameraWorker(threading.Thread):
 				self._reconnect()
 		except api.ApiError as e:
 			self._error('{} failed ({})'.format(label, e))
-			if e.status == 0 and self._legacy:
-				# a camera without an event channel only shows it is gone when a command fails
-				self._update(online=False)
-				self._connected = False
-				if self.channel:
-					self.channel.retry_now()
 		except (ValueError, TypeError) as e:
 			self._error('{}: bad value ({})'.format(label, e))
 
@@ -1337,9 +1427,6 @@ class CameraWorker(threading.Thread):
 		"""After a command, read what the camera took."""
 		if self.QUIET_DURING_TAKE and self._listening and self.state['recording']:
 			return   # its events confirm
-		if not self._listening and not self._legacy:
-			self._resync_due = True   # the channel is down: everything is read when it is back
-			return
 		for path in self.READ_BACK.get(param, ()):
 			if path == '/lens/cameras/active' and not self._lenses:
 				continue
@@ -1691,7 +1778,7 @@ class CameraManager:
 		self.discovery = {'running': False, 'mode': None, 'results': [], 'error': None, 'finished': 0}
 		self._save_timer = None
 		self.live = livestream.LiveServer()
-		self.alert_sound = True                 # system notification + sound on alerts (macOS)
+		self.notify = True                      # system notification on alarms (macOS), silent
 		self.settings = {'interface': 'auto'}   # network interface for discovery / live view
 		self.http_port = None                   # set by server.py, for the panel address
 		self._load()
@@ -1757,15 +1844,15 @@ class CameraManager:
 
 	def alert(self, msg):
 		"""Something the operator must see now: logged with an ALERT prefix and, on a Mac,
-		shown as a system notification with a sound so it is heard even with the panel
-		in the background. `alert_sound` turns the notification off."""
+		shown as a system notification (no sound) so it is seen even with the panel in
+		the background. `notify` turns the notification off."""
 		self._log('ALERT ' + msg)
-		if not self.alert_sound or sys.platform != 'darwin':
+		if not self.notify or sys.platform != 'darwin':
 			return
 		def quote(s):
 			return s.replace('\\', '\\\\').replace('"', '\\"')
 		title, _, text = msg.partition(': ')
-		script = 'display notification "{}" with title "LUCam: {}" sound name "Sosumi"'.format(
+		script = 'display notification "{}" with title "LUCam: {}"'.format(
 			quote(text[:200] or msg[:200]), quote(title[:40]))
 		try:
 			subprocess.Popen(['osascript', '-e', script], stdin=subprocess.DEVNULL,

@@ -136,11 +136,12 @@ class EventChannel(threading.Thread):
 	  on_refused(address)     a server answered there without an event channel
 	  on_event(property, value)
 
-	Reconnects by itself: at once after a drop, then every RETRY seconds.
+	Reconnects by itself: at once after a drop, then every RETRY seconds (RETRY_REFUSED
+	on a server that answers without opening the channel).
 	"""
 
 	RETRY = 1.0            # between attempts while the camera does not answer
-	RETRY_REFUSED = 30.0   # between attempts on a server that has no event channel
+	RETRY_REFUSED = 5.0    # between attempts on a server that does not open the event channel
 
 	def __init__(self, candidates, on_event, on_open, on_close, on_refused, on_unreachable=None, name='lucam-events'):
 		super().__init__(name=name, daemon=True)
@@ -214,6 +215,7 @@ class EventChannel(threading.Thread):
 		return self._send(_frame(0x1, json.dumps(msg).encode()))
 
 	def run(self):
+		short = 0   # connections in a row that closed within 2 s of opening
 		while not self._halt.is_set():
 			refused = None
 			opened = False
@@ -229,12 +231,19 @@ class EventChannel(threading.Thread):
 				except (OSError, ValueError):
 					continue
 				opened = True
+				since = time.monotonic()
 				self._serve(sock, rest, address)
 				break
 			if self._halt.is_set():
 				return
 			if opened:
-				continue   # it was open and dropped: try again at once
+				# It was open and dropped: try again at once. Unless it keeps closing as
+				# soon as it opens, which must not turn into a storm of reconnections.
+				short = short + 1 if time.monotonic() - since < 2.0 else 0
+				if short >= 2:
+					self._wake.wait(self.RETRY)
+					self._wake.clear()
+				continue
 			try:
 				if refused:
 					self.on_refused(refused)

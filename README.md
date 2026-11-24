@@ -120,10 +120,10 @@ too (System Settings > General > Date & Time > Set time automatically).
 
 The camera's API reports no dropped frames, no load and no temperature, so the
 controller raises the alarms itself. Each one shows as a blinking red line in the
-camera's row, plays three beeps, writes an `ALERT` line in the log (and in the
-events file, with `--log`) and, on a Mac, shows a system notification with a
-sound even when the panel is in the background (`--no-alert-sound` turns that
-off).
+camera's row, writes an `ALERT` line in the log (and in the events file, with
+`--log`) and, on a Mac, shows a system notification, so it is seen even when the
+panel is in the background (`--no-notifications` turns that off). No sound is
+played.
 
 - **Stopped by the camera.** A camera that was recording reports that it is not,
   and LUCam did not send the STOP: the camera, or someone at the phone, ended the
@@ -136,6 +136,10 @@ off).
   seconds: the app crashed, was closed, or the phone was locked.
 - **Not carried out.** The camera acknowledged a REC or a STOP and its state did
   not change within 3 seconds.
+- **Polled, not listened to.** A phone that has an event channel has been polled
+  for 10 seconds because the channel cannot be opened. This is the situation
+  that slows the app (see [How it talks to the phones](#how-it-talks-to-the-phones)).
+  Press ↻; if it stays, stop the controller.
 - **App slow.** The phone takes 250 ms longer to answer than a fresh app. An app
   in that state drops frames while recording, and only quitting and relaunching
   Blackmagic Camera on the phone clears it. The line stays while it lasts. From
@@ -157,9 +161,9 @@ preset is removed from the phone afterwards (`--keep` leaves it).
 
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.
   An unarmed camera is still listened to, so its row stays live, but the
-  controller sends it nothing of its own accord: no timing check, and a held
-  white balance or a locked focus is not put back until it is armed again.
-  Commands you give on its row still go.
+  controller sends it nothing of its own accord: no timing check, no polling
+  if it has no event channel, and a held white balance or a locked focus is
+  not put back until it is armed again. Commands you give on its row still go.
 - Under each camera's name: its address and the time it takes to answer, in
   milliseconds (amber when it slows down). The **Link** line of the expanded row
   says since when the controller has been listening to the camera's events, how
@@ -222,12 +226,12 @@ a later build may behave differently).
 The controller is built around that:
 
 1. **It listens first.** The event channel is opened before a phone is sent
-   anything, and kept open. If it drops, it is reopened at once, the
-   interruption is logged, and nothing is sent in the meantime.
-2. **It does not poll.** Tally, timecode and settings come from the phone's
-   events. Settings are read once when the channel opens, then only on demand:
-   after a command, when a row is expanded (autofocus and the screen's LUT
-   have no event), after a format change.
+   anything, and kept open. If it drops, it is reopened at once and the
+   interruption is logged.
+2. **It does not poll a phone it can listen to.** Tally, timecode and settings
+   come from the phone's events. Settings are read once when the channel
+   opens, then only on demand: after a command, when a row is expanded
+   (autofocus and the screen's LUT have no event), after a format change.
 3. **One request at a time per phone.** The app serves one request per
    connection and closes it.
 4. **It times every answer.** Every 30 seconds an armed camera gets one small
@@ -244,9 +248,20 @@ is what tells you about such a phone. `QUIET_DURING_TAKE = True` in
 `python/lucam/manager.py` makes the controller send a recording camera nothing
 but REC and STOP.
 
-A camera with no event channel (not the iPhone app at 3.5) is marked *not
-live*: its settings are read once and after each command, and ↻ reads them
-again. It is not polled.
+**When there is no event channel, the controller polls**, about 11 requests a
+second, as it did before it could listen:
+
+- A camera that has none (another Blackmagic camera, an older app) is polled
+  and its row says **POLLED** in amber under the camera's name.
+- A phone whose channel drops is polled from one second after the drop until
+  the channel is back, which normally takes a second or two. If the phone
+  stops answering, the controller waits for the channel, so that the listener
+  is there first when the phone returns.
+- A phone that has the channel and stays polled for 10 seconds raises the
+  *Polled, not listened to* alarm: on Blackmagic Camera 3.5 this is the state
+  that must not last.
+
+An unarmed camera is never polled.
 
 What this does not cover: any other client that sends requests to a phone
 while nothing listens to it has the same effect, whatever LUCam does. LUCam's
@@ -386,8 +401,8 @@ python3 tests/test_engine.py
 ```
 
 checks the controller against such cameras: no request before the event
-channel is open, none on a timer, none to an unarmed camera or while the
-channel is down, and each alarm.
+channel is open, none on a timer while it is open, none to an unarmed camera,
+polling when there is no channel, and each alarm.
 
 ## Notes from real-iPhone testing
 

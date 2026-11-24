@@ -4,8 +4,8 @@
     python3 tests/test_engine.py
 
 The rules under test: the event channel is open before anything is sent; nothing
-is read on a timer; nothing is sent to an unarmed camera or while the channel is
-down; the alarms fire. Standard library only.
+is read on a timer while it is open; nothing is sent to an unarmed camera; a camera
+without the channel is polled and says so; the alarms fire. Standard library only.
 """
 
 import json
@@ -20,12 +20,14 @@ sys.path.insert(0, os.path.join(ROOT, 'python'))
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
 import mock_camera  # noqa: E402
-from lucam import CameraManager  # noqa: E402
+from lucam import CameraManager, events  # noqa: E402
 from lucam.manager import CameraWorker  # noqa: E402
 
 # Shorter than on set, so the suite runs in under a minute.
 FAST = {'HEALTH_INTERVAL': 3600.0, 'REC_GRACE': 0.3, 'REC_CONFIRM': 1.0, 'LOST_WHILE_RECORDING': 1.0,
-		'OFFLINE_AFTER': 0.5, 'TICK': 0.1, 'WB_RESTORE_EVERY': 0.3, 'BACK_OFF': 0.5}
+		'OFFLINE_AFTER': 0.5, 'TICK': 0.1, 'WB_RESTORE_EVERY': 0.3, 'BACK_OFF': 0.5,
+		'POLL_AFTER_DROP': 0.5, 'POLLED_ALARM_AFTER': 1.0, 'RETRY_OFFLINE': 0.5}
+events.EventChannel.RETRY_REFUSED = 0.5
 
 
 def wait(cond, timeout=6.0):
@@ -40,14 +42,15 @@ def wait(cond, timeout=6.0):
 class Rig:
 	"""One simulated camera and a controller connected to it."""
 
-	def __init__(self, events=True, **settings):
+	def __init__(self, events=True, ws_broken=False, **settings):
 		self.saved = {k: getattr(CameraWorker, k) for k in dict(FAST, **settings)}
 		for k, v in dict(FAST, **settings).items():
 			setattr(CameraWorker, k, v)
 		self.server, self.cam = mock_camera.start(0, 'Mock', True, events, host='127.0.0.1')
+		self.cam.ws_broken = ws_broken
 		self.port = self.server.server_address[1]
 		self.manager = CameraManager(config_path=None, autosave=False)
-		self.manager.alert_sound = False
+		self.manager.notify = False
 		self.id = self.manager.add_camera('http://127.0.0.1:{}'.format(self.port))
 
 	def close(self):
@@ -247,7 +250,7 @@ class EngineTest(unittest.TestCase):
 		self.assertIn('APP SLOW', r.log())
 		self.assertGreaterEqual(r.state()['delayMs'], 250)
 
-	def test_a_dropped_event_channel_is_reopened_and_nothing_is_sent_meanwhile(self):
+	def test_a_dropped_event_channel_is_reopened_before_any_polling(self):
 		r = self.rig()
 		r.mock('POST', 'drop')
 		self.assertTrue(wait(lambda: r.state()['gaps'] == 1 and r.state()['events'] == 'listening'), r.log())
@@ -257,16 +260,53 @@ class EngineTest(unittest.TestCase):
 		self.assertEqual(st['withoutListener'], 0, 'a request was sent while the event channel was down')
 		self.assertTrue(r.state()['online'])
 
-	def test_a_camera_without_an_event_channel_is_read_once_and_not_polled(self):
+	def test_a_camera_without_an_event_channel_is_polled_and_says_so(self):
 		r = self.rig(events=False)
 		s = r.state()
-		self.assertEqual(s['events'], 'none')
+		self.assertEqual((s['events'], s['polled']), ('none', True))
 		self.assertEqual((s['iso'], s['letter']), (400, 'A'))
 		before = r.stats()['requests']
-		time.sleep(2.5)
-		self.assertEqual(r.stats()['requests'], before)
-		r.manager.set_param(r.id, 'iso', 800)
+		time.sleep(2.0)
+		self.assertGreater(r.stats()['requests'] - before, 8)
+		r.mock('POST', 'set', {'iso': 800})                 # a change on the camera is picked up
 		self.assertTrue(wait(lambda: r.state()['iso'] == 800))
+		time.sleep(1.5)
+		self.assertIsNone(r.state()['pollAlert'])           # it has no channel: a label, not an alarm
+		r.manager.update_camera(r.id, active=False)         # unarmed: not polled
+		time.sleep(0.5)
+		before = r.stats()['requests']
+		time.sleep(1.5)
+		self.assertEqual(r.stats()['requests'], before)
+
+	def test_a_phone_whose_channel_will_not_open_is_polled_and_raises_the_alarm(self):
+		# what happened with the Python 3.13 defect: the phone has the channel, the controller
+		# cannot use it, and polls with nothing listening
+		r = self.rig(ws_broken=True)
+		self.assertTrue(wait(lambda: r.state()['polled']))
+		self.assertEqual(r.stats()['listeners'], 0)
+		self.assertTrue(wait(lambda: r.state()['pollAlert'] is not None, 5), r.log())
+		self.assertIn('POLLED WITH NOTHING LISTENING', r.log())
+		r.cam.ws_broken = False                             # the channel can be opened again
+		self.assertTrue(wait(lambda: r.state()['events'] == 'listening' and not r.state()['polled'], 8), r.log())
+		self.assertTrue(wait(lambda: r.state()['pollAlert'] is None))
+		time.sleep(0.5)
+		before = r.stats()['requests']
+		time.sleep(1.5)
+		self.assertEqual(r.stats()['requests'], before, 'still polled with the channel open')
+
+	def test_a_channel_that_stays_down_falls_back_to_polling_with_the_alarm(self):
+		r = self.rig()
+		self.assertFalse(r.state()['polled'])
+		r.cam.ws_broken = True
+		r.mock('POST', 'drop')
+		self.assertTrue(wait(lambda: r.state()['polled']), r.log())
+		r.mock('POST', 'set', {'iso': 800})                 # the panel stays live by polling
+		self.assertTrue(wait(lambda: r.state()['iso'] == 800))
+		self.assertTrue(r.state()['online'])
+		self.assertTrue(wait(lambda: r.state()['pollAlert'] is not None, 5), r.log())
+		r.cam.ws_broken = False
+		self.assertTrue(wait(lambda: r.state()['events'] == 'listening' and r.state()['pollAlert'] is None, 8), r.log())
+		self.assertGreaterEqual(r.state()['gaps'], 1)
 
 	def test_quiet_takes_leave_a_camera_found_recording_alone(self):
 		server, cam = mock_camera.start(0, 'Rolling', host='127.0.0.1')
@@ -278,7 +318,7 @@ class EngineTest(unittest.TestCase):
 			setattr(CameraWorker, k, v)
 		self.addCleanup(lambda: [setattr(CameraWorker, k, v) for k, v in saved.items()])
 		manager = CameraManager(config_path=None, autosave=False)
-		manager.alert_sound = False
+		manager.notify = False
 		self.addCleanup(manager.shutdown)
 		cam_id = manager.add_camera('http://127.0.0.1:{}'.format(server.server_address[1]))
 		state = lambda: manager._worker(cam_id).snapshot()
