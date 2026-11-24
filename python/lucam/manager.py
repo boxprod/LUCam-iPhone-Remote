@@ -1492,10 +1492,14 @@ class CameraWorker(threading.Thread):
 			if now < self._hold_after[key] or not self._may_send(during_take=self.HOLD_DURING_TAKE):
 				continue
 			self._hold_check.discard(key)
-			if key == 'wb' and self._restore_wb():
-				self._hold_after[key] = now + self.WB_RESTORE_EVERY
-			elif key == 'focus' and self._restore_focus():
-				self._hold_after[key] = now + self.FOCUS_RESTORE_EVERY
+			try:
+				if key == 'wb' and self._restore_wb():
+					self._hold_after[key] = now + self.WB_RESTORE_EVERY
+				elif key == 'focus' and self._restore_focus():
+					self._hold_after[key] = now + self.FOCUS_RESTORE_EVERY
+			except api.ApiError:
+				self._hold_check.add(key)   # unanswered: still owed, after the back-off
+				raise
 
 	def _restore_wb(self):
 		"""Put back a held WB/tint the phone has changed (auto WB, someone on the phone).
