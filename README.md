@@ -160,10 +160,8 @@ preset is removed from the phone afterwards (`--keep` leaves it).
 ## 4. Using the UI
 
 - **Arm** (checkbox on each row): only armed cameras receive global values and REC ALL.
-  An unarmed camera is still listened to, so its row stays live, but the
-  controller sends it nothing of its own accord: no timing check, no polling
-  if it has no event channel, and a held white balance or a locked focus is
-  not put back until it is armed again. Commands you give on its row still go.
+  An unarmed camera is otherwise treated like any other: listened to (or
+  polled), its answers timed, its held values put back.
 - Under each camera's name: its address and the time it takes to answer, in
   milliseconds (amber when it slows down). The **Link** line of the expanded row
   says since when the controller has been listening to the camera's events, how
@@ -234,11 +232,9 @@ The controller is built around that:
    (autofocus and the screen's LUT have no event), after a format change.
 3. **One request at a time per phone.** The app serves one request per
    connection and closes it.
-4. **It times every answer.** Every 30 seconds an armed camera gets one small
+4. **It times every answer.** Every 30 seconds each camera gets one small
    read, to measure how long the app takes. That time is shown under the
    camera's name and drives the *App slow* alarm.
-5. **It sends nothing to a camera that is not armed**, beyond what you ask for
-   on its row.
 
 A take is treated like any other moment: with the event channel open, requests
 during recordings did no harm in the long tests. On a phone that something
@@ -260,8 +256,6 @@ second, as it did before it could listen:
 - A phone that has the channel and stays polled for 10 seconds raises the
   *Polled, not listened to* alarm: on Blackmagic Camera 3.5 this is the state
   that must not last.
-
-An unarmed camera is never polled.
 
 What this does not cover: any other client that sends requests to a phone
 while nothing listens to it has the same effect, whatever LUCam does. LUCam's
@@ -401,8 +395,8 @@ python3 tests/test_engine.py
 ```
 
 checks the controller against such cameras: no request before the event
-channel is open, none on a timer while it is open, none to an unarmed camera,
-polling when there is no channel, and each alarm.
+channel is open, none on a timer while it is open, polling when there is no
+channel, and each alarm.
 
 ## Notes from real-iPhone testing
 

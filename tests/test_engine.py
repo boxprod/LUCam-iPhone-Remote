@@ -4,8 +4,8 @@
     python3 tests/test_engine.py
 
 The rules under test: the event channel is open before anything is sent; nothing
-is read on a timer while it is open; nothing is sent to an unarmed camera; a camera
-without the channel is polled and says so; the alarms fire. Standard library only.
+is read on a timer while it is open; a camera without the channel is polled and says
+so; the alarms fire. Standard library only.
 """
 
 import json
@@ -25,7 +25,7 @@ from lucam.manager import CameraWorker  # noqa: E402
 
 # Shorter than on set, so the suite runs in under a minute.
 FAST = {'HEALTH_INTERVAL': 3600.0, 'REC_GRACE': 0.3, 'REC_CONFIRM': 1.0, 'LOST_WHILE_RECORDING': 1.0,
-		'OFFLINE_AFTER': 0.5, 'TICK': 0.1, 'WB_RESTORE_EVERY': 0.3, 'BACK_OFF': 0.5,
+		'TICK': 0.1, 'WB_RESTORE_EVERY': 0.3, 'BACK_OFF': 0.5,
 		'POLL_AFTER_DROP': 0.5, 'POLLED_ALARM_AFTER': 1.0, 'RETRY_OFFLINE': 0.5}
 events.EventChannel.RETRY_REFUSED = 0.5
 
@@ -218,19 +218,17 @@ class EngineTest(unittest.TestCase):
 		r.mock('POST', 'set', {'focus': 0.9})
 		self.assertTrue(wait(lambda: abs(r.cam.state['focus'] - 0.5) < 0.01), r.log())
 
-	def test_an_unarmed_camera_is_sent_nothing(self):
-		r = self.rig(HEALTH_INTERVAL=0.2)
+	def test_an_unarmed_camera_is_watched_like_any_other(self):
+		r = self.rig(HEALTH_INTERVAL=0.3)
 		r.manager.set_param(r.id, 'wb', 3200)
 		self.assertTrue(wait(lambda: r.state()['wbHold'].get('wb') == 3200))
 		r.manager.update_camera(r.id, active=False)
-		time.sleep(0.5)
 		before = r.stats()['requests']
 		r.mock('POST', 'set', {'wb': 6500})
-		self.assertTrue(wait(lambda: r.state()['wb'] == 6500))   # still listened to
+		self.assertTrue(wait(lambda: r.cam.state['wb'] == 3200), 'the hold is not kept on an unarmed camera')
 		time.sleep(1.0)
-		self.assertEqual(r.stats()['requests'], before, 'an unarmed camera was sent requests: {}'.format(r.stats()['last'][-6:]))
-		r.manager.update_camera(r.id, active=True)
-		self.assertTrue(wait(lambda: r.cam.state['wb'] == 3200), 'the hold did not resume when the camera was armed')
+		self.assertGreater(r.stats()['requests'], before + 2)   # its answers are still timed
+		self.assertEqual(r.stats()['withoutListener'], 0)
 
 	def test_the_health_check_is_one_small_read(self):
 		r = self.rig(HEALTH_INTERVAL=0.5)
@@ -272,11 +270,10 @@ class EngineTest(unittest.TestCase):
 		self.assertTrue(wait(lambda: r.state()['iso'] == 800))
 		time.sleep(1.5)
 		self.assertIsNone(r.state()['pollAlert'])           # it has no channel: a label, not an alarm
-		r.manager.update_camera(r.id, active=False)         # unarmed: not polled
-		time.sleep(0.5)
+		r.manager.update_camera(r.id, active=False)         # unarmed: polled all the same
 		before = r.stats()['requests']
 		time.sleep(1.5)
-		self.assertEqual(r.stats()['requests'], before)
+		self.assertGreater(r.stats()['requests'] - before, 5)
 
 	def test_a_phone_whose_channel_will_not_open_is_polled_and_raises_the_alarm(self):
 		# what happened with the Python 3.13 defect: the phone has the channel, the controller

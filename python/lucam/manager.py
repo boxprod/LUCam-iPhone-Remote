@@ -193,7 +193,8 @@ class CameraWorker(threading.Thread):
 	  So is one whose channel has dropped, until it is back; if that lasts, on a
 	  camera that does have the channel, the worker raises the alarm.
 	- With QUIET_DURING_TAKE, a recording camera is sent nothing but REC and STOP.
-	- An unarmed camera is listened to and sent nothing of the worker's accord.
+	- An unarmed camera is treated like any other: arming only decides whether it
+	  takes global values and REC ALL.
 	- One request at a time per camera (api.CameraClient holds the lock).
 	- Every answer is timed. A camera whose answers slow down is flagged, since
 	  the API reports neither dropped frames nor load.
@@ -206,7 +207,6 @@ class CameraWorker(threading.Thread):
 	REC_GRACE = 3.0            # s after REC during which 'not recording' is not an alarm
 	REC_CONFIRM = 3.0          # s to wait for the camera to confirm a REC or STOP by an event
 	TICK = 1.0                 # housekeeping interval; a tick sends nothing by itself
-	OFFLINE_AFTER = 3.0        # s without the event channel before an unarmed camera shows as offline
 	# Without the event channel the controller asks, as it always did: for a camera that has
 	# none, and for one whose channel has dropped, until it is back.
 	POLL_FAST = 0.5            # record state, timecode, focus
@@ -219,7 +219,7 @@ class CameraWorker(threading.Thread):
 	PING_AFTER = 5.0           # s of silence on the event channel before a ping
 	SILENT_AFTER = 10.0        # s of silence before the connection is taken for dead
 	# The one read on a timer: a single small GET to time the app's answer, only for an
-	# armed, idle camera whose event channel is open (0.3 status line per request there,
+	# camera whose event channel is open (0.3 status line per request there,
 	# against about 105 without a listener).
 	HEALTH_INTERVAL = 30.0
 	HEALTH_WINDOW = 5          # answers the median is taken over
@@ -324,7 +324,7 @@ class CameraWorker(threading.Thread):
 		self._hold_check = set()       # holds to compare with the camera at the next tick
 		self._hold_after = {'wb': 0.0, 'focus': 0.0}
 		self._reread_at = {}           # path -> when it was last re-read after an event we could not use
-		self._was = {'recording': False, 'active': bool(active)}
+		self._was_recording = False
 		self._rec_started = 0.0        # when the current recording began (ours or started on the phone)
 		self._rec_expected = None      # True/False while a REC/STOP of ours waits for the camera's event
 		self._rec_reported = None      # what the camera last said
@@ -597,7 +597,7 @@ class CameraWorker(threading.Thread):
 		polled = bool(polled and s['online'])
 		if polled != s['polled']:
 			self._update(polled=polled)
-		if polled and s['active'] and (self._had_channel or self._lists_events):
+		if polled and (self._had_channel or self._lists_events):
 			now = time.monotonic()
 			if self._polled_since is None:
 				self._polled_since = now
@@ -613,8 +613,8 @@ class CameraWorker(threading.Thread):
 				self._update(pollAlert=None)
 
 	def _resync(self, first=False, light=False):
-		"""Read the camera's state once. Deferred while that is not allowed (it is unarmed
-		and already known, or it records and takes are kept quiet)."""
+		"""Read the camera's state once. Deferred while that is not allowed (it records
+		and takes are kept quiet)."""
 		if self._legacy:
 			self._read_all() if not light else self._read_unbroadcast()
 			return
@@ -622,7 +622,7 @@ class CameraWorker(threading.Thread):
 			if not light:
 				self._resync_due = True
 			return
-		if not self._may_send(armed=not first and not light):
+		if not self._may_send():
 			self._resync_due = self._resync_due or not light
 			return
 		if light:
@@ -653,12 +653,12 @@ class CameraWorker(threading.Thread):
 		if isinstance(props, list):
 			self.channel.subscribe([p for p in props if isinstance(p, str)])
 
-	def _may_send(self, armed=True):
+	def _may_send(self):
 		"""Whether the worker may send this camera a request of its own accord."""
 		s = self.state
 		return bool(s['online'] and not s['recordPending']
 					and not (self.QUIET_DURING_TAKE and s['recording'] and self._listening)
-					and (s['active'] or not armed) and time.monotonic() >= self._auto_after)
+					and time.monotonic() >= self._auto_after)
 
 	def _unanswered(self, what, e):
 		"""A request of the worker's own went unanswered: say so and hold off."""
@@ -696,10 +696,8 @@ class CameraWorker(threading.Thread):
 		# A dropped channel reopens by itself; once the camera stops answering, its return
 		# is left to the channel, so that the listener is there first again.
 		polled = self._legacy or (down is not None and now - down >= self.POLL_AFTER_DROP and s['online'])
-		if polled and (s['active'] or not self._connected):
+		if polled:
 			self._poll(now)
-		elif down is not None and not self._legacy and s['online'] and now - down > self.OFFLINE_AFTER:
-			self._went_offline('event channel lost')   # unarmed, so not polled: the channel is all there is
 		self._watch_polling(polled)
 		if not s['online']:
 			since = self._offline_since
@@ -726,11 +724,11 @@ class CameraWorker(threading.Thread):
 				and time.time() - self._rec_started >= self.REC_GRACE:
 			self._on_record(False)
 		# transitions that make deferred work due
-		if self._was['recording'] and not s['recording'] or s['active'] and not self._was['active']:
+		if self._was_recording and not s['recording']:
 			self._hold_check.update(k for k in ('wb', 'focus') if self._holding(k))
 			self._next_health = min(self._next_health, now + 2)
-		self._was = {'recording': s['recording'], 'active': s['active']}
-		if self._resync_due and self._listening and self._may_send(armed=self._connected):
+		self._was_recording = s['recording']
+		if self._resync_due and self._listening and self._may_send():
 			self._resync(first=not self._connected)
 		elif self._caps_dirty and self._connected and self._may_send():
 			self._load_capabilities()
@@ -1058,7 +1056,7 @@ class CameraWorker(threading.Thread):
 			return
 		if self._zero_bitrate_since is None or now - self._zero_bitrate_since < 8:
 			return
-		if now - self._live_checked >= self.LIVE_CHECK_EVERY and self._may_send(armed=False):
+		if now - self._live_checked >= self.LIVE_CHECK_EVERY and self._may_send():
 			self._live_checked = now
 			self._read('stream', '/livestreams/0')
 
@@ -1907,7 +1905,6 @@ class CameraManager:
 				w.state['name'] = str(name).strip()
 			if active is not None:
 				w.state['active'] = bool(active)
-		w.queue('wake')   # arming makes deferred work due
 		self._save_later()
 
 	def _worker(self, cam_id):
